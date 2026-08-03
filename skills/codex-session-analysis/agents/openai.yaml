@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Analysis"
+  short_description: "Analyze Codex sessions over a date range"
+  default_prompt: "Use $codex-session-analysis to analyze and summarize what Codex worked on from a requested start date to end date."
