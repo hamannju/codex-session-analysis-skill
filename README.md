@@ -28,12 +28,14 @@ The installed skill is named `codex-session-analysis` and is invoked as
 
 ## Validate
 
-Requirements: Git, `uv`, and a local Codex installation containing the system
-`skill-creator` validator.
+Requirements: Git and `uv`. The validation script prefers the system
+`skill-creator` validator from a local Codex installation and falls back to a
+repository-owned compatible validator in clean environments.
 
 ```bash
 ./scripts/validate.sh
 ```
 
-Set `SKILL_VALIDATOR=/absolute/path/to/quick_validate.py` when the validator is
-not available under the default Codex home.
+Set `SKILL_VALIDATOR=/absolute/path/to/quick_validate.py` or
+`SKILL_CREATOR_DIR=/absolute/path/to/skill-creator` to require a specific
+external validator.
