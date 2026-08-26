@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import contextlib
 import hashlib
 import json
@@ -11,17 +10,19 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-SCHEMA_VERSION = "2.0"
-COLLECTOR_VERSION = "2.1.0"
+SCHEMA_VERSION = "2.1"
+COLLECTOR_VERSION = "2.2.0"
 SCRIPT_PATH = Path(__file__).resolve()
 SOURCE_NAMES = ("history", "sessions", "rollout_summaries", "git", "notes")
+TASK_HISTORY_PRELUDE_SECONDS = 5
 KNOWN_SESSION_RECORD_TYPES = {
     "compacted",
     "event_msg",
@@ -128,6 +129,94 @@ class CollectorDiagnostics:
         return {"sources": {name: item.as_dict() for name, item in self._sources.items()}}
 
 
+@dataclass
+class ScopeMetrics:
+    events: int = 0
+    user_events: int = 0
+    tool_call_records: int = 0
+    tool_invocations_estimate: int = 0
+    unresolved_tool_call_records: int = 0
+    invocation_unresolved_records: int = 0
+    workdir_unresolved_records: int = 0
+    syntax_dynamic_uncertain_records: int = 0
+    records_by_type: dict[str, int] = field(
+        default_factory=lambda: {"function_call": 0, "custom_tool_call": 0}
+    )
+    explicit_workdir_records: int = 0
+    session_cwd_fallback_records: int = 0
+    tool_workdirs: set[str] = field(default_factory=set)
+    first_event: datetime | None = None
+    last_event: datetime | None = None
+
+
+@dataclass
+class ActivityAnchor:
+    timestamp: datetime
+    kind: str
+    workdirs: tuple[str, ...] = ()
+
+
+@dataclass
+class LocatorHit:
+    timestamp: datetime | None
+    kind: str
+    turn_id: str
+
+
+@dataclass
+class TaskInventory:
+    turn_id: str
+    start: datetime
+    end: datetime | None = None
+    metrics: ScopeMetrics = field(default_factory=ScopeMetrics)
+    anchors: list[ActivityAnchor] = field(default_factory=list)
+
+
+@dataclass
+class SessionInventory:
+    path: Path
+    canonical: dict[str, Any]
+    session_meta_records: int
+    invalid_session_meta_records: int
+    parent_session_id: str
+    forked_from_id: str
+    thread_source: str
+    agent_path: str
+    spawn_depth: Any
+    metrics: ScopeMetrics
+    tasks: list[TaskInventory]
+    unbound_anchors: list[ActivityAnchor]
+    unbound_workdirs: set[str]
+    locator_hits: list[LocatorHit] = field(default_factory=list)
+
+    @property
+    def session_id(self) -> str:
+        return str(self.canonical.get("id") or self.path.stem)
+
+    @property
+    def cwd(self) -> str:
+        return str(self.canonical.get("cwd") or "")
+
+
+@dataclass
+class SessionScanResult:
+    inventories: list[SessionInventory]
+    strategy: str
+    requested_session_ids: tuple[str, ...]
+    files_available: int
+    files_read: int
+    fallback_used: bool
+
+
+@dataclass
+class SessionSelection:
+    inventory: SessionInventory
+    scope_match: dict[str, str]
+    task_indexes: tuple[int, ...] | None
+    history_binding: str
+    project_root: Path | None = None
+
+
 def non_negative_int(value: str) -> int:
     parsed = int(value)
     if parsed < 0:
@@ -142,9 +231,47 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def source_names(value: str) -> tuple[str, ...]:
+    aliases = {
+        "history": "history",
+        "sessions": "sessions",
+        "summaries": "rollout_summaries",
+        "rollout_summaries": "rollout_summaries",
+        "git": "git",
+        "notes": "notes",
+    }
+    requested: list[str] = []
+    unknown: list[str] = []
+    for item in value.split(","):
+        name = item.strip().lower()
+        if not name:
+            continue
+        if name not in aliases:
+            unknown.append(name)
+            continue
+        canonical = aliases[name]
+        if canonical not in requested:
+            requested.append(canonical)
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            "unknown source(s): " + ", ".join(sorted(unknown))
+        )
+    if not requested:
+        raise argparse.ArgumentTypeError("at least one source is required")
+    return tuple(requested)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract a sanitized evidence pack for a Codex Session Analysis."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=(
+            f"codex-session-analysis {COLLECTOR_VERSION} "
+            f"(schema {SCHEMA_VERSION})"
+        ),
     )
     parser.add_argument("--start", help="Start date/time, e.g. 2026-05-15 or 2026-05-15 08:00")
     parser.add_argument("--end", help="End date/time, e.g. 2026-05-18 17:40. Defaults to now")
@@ -156,6 +283,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Report scope. local is the default and combines current session plus current project",
     )
     parser.add_argument("--session-id", help="Limit to this Codex session ID. Prefixes are accepted")
+    parser.add_argument(
+        "--mode",
+        choices=("evidence", "locate"),
+        default="evidence",
+        help="Build a full evidence pack or locate matching session/task candidates",
+    )
+    parser.add_argument(
+        "--match",
+        action="append",
+        default=[],
+        help="Text to locate in sanitized source fields. Repeat for multiple terms",
+    )
+    parser.add_argument(
+        "--sources",
+        type=source_names,
+        help="Comma-separated sources: history,sessions,summaries,git,notes",
+    )
     parser.add_argument("--cwd", default=str(Path.cwd()), help="Current working directory for local/project scope")
     parser.add_argument("--project-root", help="Project root for project/local scope. Defaults to git root of --cwd")
     parser.add_argument(
@@ -184,7 +328,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=30,
         help="Maximum gap contributing to the non-additive activity-coverage estimate",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.mode == "locate" and not any(term.strip() for term in args.match):
+        parser.error("--mode locate requires at least one non-empty --match")
+    return args
 
 
 def parse_dt(value: str, tz: ZoneInfo, *, is_end: bool) -> datetime:
@@ -265,11 +412,19 @@ def preview(text: str, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-def read_jsonl(
+def matches_terms(values: list[str], match_terms: list[str] | tuple[str, ...]) -> bool:
+    terms = [term.strip().casefold() for term in match_terms if term.strip()]
+    if not terms:
+        return False
+    haystack = "\n".join(values).casefold()
+    return any(term in haystack for term in terms)
+
+
+def iter_jsonl(
     path: Path,
     diagnostics: CollectorDiagnostics | None = None,
     source: str = "sessions",
-) -> list[dict[str, Any]]:
+) -> Any:
     resolved = normalize_path(path)
     source_diagnostic = diagnostics.source(source) if diagnostics else None
     record_diagnostics = False
@@ -278,7 +433,6 @@ def read_jsonl(
         record_diagnostics = resolved not in diagnostics.jsonl_diagnosed_paths
         diagnostics.jsonl_diagnosed_paths.add(resolved)
 
-    rows: list[dict[str, Any]] = []
     try:
         with resolved.open("r", encoding="utf-8", errors="replace") as handle:
             if source_diagnostic and record_diagnostics:
@@ -296,7 +450,6 @@ def read_jsonl(
                         source_diagnostic.malformed_records += 1
                     continue
                 if isinstance(obj, dict):
-                    rows.append(obj)
                     if source_diagnostic and record_diagnostics:
                         source_diagnostic.records_read += 1
                         timestamp_value = obj.get("ts") if source == "history" else obj.get("timestamp")
@@ -314,14 +467,23 @@ def read_jsonl(
                                     and bool(payload["id"])
                                 ):
                                     source_diagnostic.schema_errors += 1
+                    yield obj
                 elif source_diagnostic and record_diagnostics:
                     source_diagnostic.non_object_records += 1
     except OSError:
         if source_diagnostic and record_diagnostics:
             source_diagnostic.io_errors += 1
             source_diagnostic.unavailable("one or more source files could not be read")
-        return []
-    return rows
+        return
+
+
+def read_jsonl(
+    path: Path,
+    diagnostics: CollectorDiagnostics | None = None,
+    source: str = "sessions",
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper for small sources and direct callers."""
+    return list(iter_jsonl(path, diagnostics, source))
 
 
 def iso_utc(ts: datetime) -> str:
@@ -342,6 +504,19 @@ def path_is_under(path: str | Path, root: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def resolve_tool_workdir(value: str, session_cwd: str) -> str | None:
+    """Resolve static workdirs without depending on the collector process CWD."""
+    candidate = value.strip()
+    if not candidate or any(marker in candidate for marker in ("$", "`", "${")):
+        return None
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        if not session_cwd:
+            return None
+        path = Path(session_cwd) / path
+    return str(normalize_path(path))
 
 
 def find_git_root(path: Path) -> Path | None:
@@ -415,12 +590,79 @@ def canonical_session_metadata(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def decode_javascript_string(value: str) -> tuple[str, bool]:
+    """Decode a quoted JavaScript string without evaluating Python syntax."""
+    if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
+        return "", True
+    result: list[str] = []
+    uncertain = False
+    cursor = 1
+    limit = len(value) - 1
+    simple_escapes = {
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "0": "\0",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+        "/": "/",
+    }
+    while cursor < limit:
+        char = value[cursor]
+        if char != "\\":
+            result.append(char)
+            cursor += 1
+            continue
+        cursor += 1
+        if cursor >= limit:
+            return "", True
+        escaped = value[cursor]
+        if escaped in simple_escapes:
+            result.append(simple_escapes[escaped])
+            cursor += 1
+            continue
+        if escaped in {"\n", "\r"}:
+            if escaped == "\r" and cursor + 1 < limit and value[cursor + 1] == "\n":
+                cursor += 1
+            cursor += 1
+            continue
+        if escaped == "x" and cursor + 2 < limit:
+            digits = value[cursor + 1 : cursor + 3]
+            if re.fullmatch(r"[0-9A-Fa-f]{2}", digits):
+                result.append(chr(int(digits, 16)))
+                cursor += 3
+                continue
+        if escaped == "u":
+            if cursor + 1 < limit and value[cursor + 1] == "{":
+                closing = value.find("}", cursor + 2, limit)
+                digits = value[cursor + 2 : closing] if closing >= 0 else ""
+                if digits and re.fullmatch(r"[0-9A-Fa-f]{1,6}", digits):
+                    codepoint = int(digits, 16)
+                    if codepoint <= 0x10FFFF:
+                        result.append(chr(codepoint))
+                        cursor = closing + 1
+                        continue
+            elif cursor + 4 < limit:
+                digits = value[cursor + 1 : cursor + 5]
+                if re.fullmatch(r"[0-9A-Fa-f]{4}", digits):
+                    result.append(chr(int(digits, 16)))
+                    cursor += 5
+                    continue
+        # JavaScript's legacy non-escape character form drops the backslash.
+        # Preserve that value while surfacing conservative parser uncertainty.
+        uncertain = True
+        result.append(escaped)
+        cursor += 1
+    return "".join(result), uncertain
+
+
 def decode_literal(value: str) -> str:
-    try:
-        parsed = ast.literal_eval(value)
-    except (SyntaxError, ValueError):
-        return ""
-    return parsed if isinstance(parsed, str) else ""
+    """Compatibility wrapper used by the lexical scanner and tests."""
+    return decode_javascript_string(value)[0]
 
 
 def javascript_wrapper_details(source: str) -> tuple[list[str], list[str], bool]:
@@ -442,7 +684,9 @@ def javascript_wrapper_details(source: str) -> tuple[list[str], list[str], bool]
             if source[cursor] == quote:
                 literal = source[position : cursor + 1]
                 if quote in {"'", '"'}:
-                    return decode_literal(literal), cursor + 1
+                    decoded, decode_uncertain = decode_javascript_string(literal)
+                    unresolved = unresolved or decode_uncertain
+                    return decoded, cursor + 1
                 return "", cursor + 1
             cursor += 1
         unresolved = True
@@ -822,7 +1066,9 @@ def parse_tool_record(payload: dict[str, Any]) -> dict[str, Any] | None:
     name = str(payload.get("name") or "")
     workdirs: list[str] = []
     invocations_estimate = 1
-    resolved = True
+    invocation_resolved = True
+    syntax_dynamic_uncertain = False
+    workdir_attribution = "session_cwd_fallback"
 
     if record_type == "function_call":
         arguments = payload.get("arguments")
@@ -838,7 +1084,8 @@ def parse_tool_record(payload: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(parsed, (dict, list)):
             workdirs = object_workdirs(parsed)
         else:
-            resolved = False
+            syntax_dynamic_uncertain = True
+            workdir_attribution = "unresolved"
     else:
         raw_input = payload.get("input")
         parsed_input: Any = None
@@ -855,11 +1102,23 @@ def parse_tool_record(payload: dict[str, Any]) -> dict[str, Any] | None:
         elif isinstance(raw_input, str) and name == "exec":
             nested_calls, workdirs, dynamic_workdir = javascript_wrapper_details(raw_input)
             invocations_estimate = len(nested_calls) or 1
-            resolved = bool(nested_calls) and not dynamic_workdir
+            invocation_resolved = bool(nested_calls)
+            syntax_dynamic_uncertain = dynamic_workdir
         elif isinstance(raw_input, str):
-            resolved = True
+            invocation_resolved = True
         else:
-            resolved = False
+            invocation_resolved = False
+            syntax_dynamic_uncertain = True
+
+    if workdirs:
+        workdir_attribution = "explicit"
+    elif syntax_dynamic_uncertain or not invocation_resolved:
+        workdir_attribution = "unresolved"
+    resolved = (
+        invocation_resolved
+        and workdir_attribution != "unresolved"
+        and not syntax_dynamic_uncertain
+    )
 
     return {
         "record_type": record_type,
@@ -867,7 +1126,278 @@ def parse_tool_record(payload: dict[str, Any]) -> dict[str, Any] | None:
         "invocations_estimate": invocations_estimate,
         "workdirs": workdirs,
         "resolved": resolved,
+        "invocation_resolved": invocation_resolved,
+        "workdir_attribution": workdir_attribution,
+        "syntax_dynamic_uncertain": syntax_dynamic_uncertain,
     }
+
+
+def metadata_details(
+    canonical: dict[str, Any],
+    session_meta_records: int,
+    invalid_session_meta_records: int,
+) -> dict[str, Any]:
+    source = canonical.get("source")
+    spawn: dict[str, Any] = {}
+    if isinstance(source, dict):
+        subagent = source.get("subagent")
+        if isinstance(subagent, dict) and isinstance(subagent.get("thread_spawn"), dict):
+            spawn = subagent["thread_spawn"]
+    if isinstance(source, str):
+        thread_source = source
+    elif isinstance(source, dict):
+        thread_source = str(source.get("type") or next(iter(source), ""))
+    else:
+        thread_source = ""
+    return {
+        "canonical": canonical,
+        "session_meta_records": session_meta_records,
+        "invalid_session_meta_records": invalid_session_meta_records,
+        "parent_session_id": str(spawn.get("parent_thread_id") or ""),
+        "forked_from_id": str(canonical.get("forked_from_id") or ""),
+        "thread_source": thread_source,
+        "agent_path": str(spawn.get("agent_path") or ""),
+        "spawn_depth": spawn.get("depth"),
+    }
+
+
+def observe_metrics(
+    metrics: ScopeMetrics,
+    obj: dict[str, Any],
+    ts: datetime,
+    call: dict[str, Any] | None,
+) -> None:
+    metrics.events += 1
+    metrics.first_event = ts if metrics.first_event is None else min(metrics.first_event, ts)
+    metrics.last_event = ts if metrics.last_event is None else max(metrics.last_event, ts)
+    payload = obj.get("payload")
+    if (
+        obj.get("type") == "event_msg"
+        and isinstance(payload, dict)
+        and payload.get("type") == "user_message"
+    ):
+        metrics.user_events += 1
+    if not call:
+        return
+    metrics.tool_call_records += 1
+    metrics.tool_invocations_estimate += int(call["invocations_estimate"])
+    metrics.records_by_type[call["record_type"]] += 1
+    metrics.tool_workdirs.update(str(item) for item in call["workdirs"])
+    if not call["resolved"]:
+        metrics.unresolved_tool_call_records += 1
+    if not call["invocation_resolved"]:
+        metrics.invocation_unresolved_records += 1
+    if call["syntax_dynamic_uncertain"]:
+        metrics.syntax_dynamic_uncertain_records += 1
+    if call["workdir_attribution"] == "explicit":
+        metrics.explicit_workdir_records += 1
+    elif call["workdir_attribution"] == "session_cwd_fallback":
+        metrics.session_cwd_fallback_records += 1
+    else:
+        metrics.workdir_unresolved_records += 1
+
+
+def activity_anchor(
+    obj: dict[str, Any],
+    ts: datetime,
+    call: dict[str, Any] | None,
+) -> ActivityAnchor | None:
+    payload = obj.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if obj.get("type") == "event_msg" and payload.get("type") in {
+        "user_message",
+        "task_started",
+        "task_complete",
+    }:
+        return ActivityAnchor(ts, str(payload.get("type")))
+    if call:
+        return ActivityAnchor(ts, "tool_call", tuple(str(item) for item in call["workdirs"]))
+    if (
+        obj.get("type") == "response_item"
+        and payload.get("type") == "message"
+        and payload.get("phase") == "final_answer"
+    ):
+        return ActivityAnchor(ts, "final_answer")
+    return None
+
+
+def scan_session_file(
+    path: Path,
+    start: datetime,
+    end: datetime,
+    diagnostics: CollectorDiagnostics | None = None,
+    match_terms: list[str] | tuple[str, ...] = (),
+) -> SessionInventory | None:
+    canonical: dict[str, Any] = {}
+    session_meta_records = 0
+    invalid_session_meta_records = 0
+    metrics = ScopeMetrics()
+    tasks: list[TaskInventory] = []
+    current_task: TaskInventory | None = None
+    unbound_anchors: list[ActivityAnchor] = []
+    unbound_workdirs: set[str] = set()
+    locator_hits: list[LocatorHit] = []
+    saw_record = False
+    last_timestamp: datetime | None = None
+
+    for obj in iter_jsonl(path, diagnostics, "sessions"):
+        saw_record = True
+        payload = obj.get("payload")
+        if obj.get("type") == "session_meta":
+            if isinstance(payload, dict) and isinstance(payload.get("id"), str) and payload["id"]:
+                session_meta_records += 1
+                if not canonical:
+                    canonical = payload
+            else:
+                invalid_session_meta_records += 1
+
+        ts = parse_event_ts(obj.get("timestamp"))
+        if ts is not None:
+            last_timestamp = ts if last_timestamp is None else max(last_timestamp, ts)
+
+        event_type = payload.get("type") if isinstance(payload, dict) else ""
+        if event_type == "task_started" and ts is not None:
+            if current_task is not None:
+                current_task.end = ts
+                tasks.append(current_task)
+            current_task = TaskInventory(str(payload.get("turn_id") or ""), ts)
+
+        call = (
+            parse_tool_record(payload)
+            if obj.get("type") == "response_item" and isinstance(payload, dict)
+            else None
+        )
+        searchable_values: list[str] = []
+        if obj.get("type") == "session_meta" and isinstance(payload, dict):
+            searchable_values.extend(
+                str(payload.get(key) or "") for key in ("id", "cwd", "forked_from_id")
+            )
+        if event_type == "user_message" and isinstance(payload, dict):
+            searchable_values.append(str(payload.get("message") or ""))
+        if call:
+            searchable_values.append(str(call["name"]))
+            searchable_values.extend(str(item) for item in call["workdirs"])
+        if current_task is not None:
+            searchable_values.append(current_task.turn_id)
+        if matches_terms(searchable_values, match_terms):
+            locator_hits.append(
+                LocatorHit(
+                    ts,
+                    (
+                        "user_message"
+                        if event_type == "user_message"
+                        else "tool_call"
+                        if call
+                        else "session_metadata"
+                    ),
+                    current_task.turn_id if current_task is not None else "",
+                )
+            )
+        if in_range(ts, start, end):
+            assert ts is not None
+            observe_metrics(metrics, obj, ts, call)
+            anchor = activity_anchor(obj, ts, call)
+            if current_task is not None:
+                observe_metrics(current_task.metrics, obj, ts, call)
+                if anchor:
+                    current_task.anchors.append(anchor)
+            else:
+                if anchor:
+                    unbound_anchors.append(anchor)
+                if call:
+                    unbound_workdirs.update(str(item) for item in call["workdirs"])
+
+        if event_type == "task_complete" and current_task is not None:
+            current_task.end = ts or last_timestamp
+            tasks.append(current_task)
+            current_task = None
+
+    if not saw_record:
+        return None
+    if current_task is not None:
+        current_task.end = last_timestamp
+        tasks.append(current_task)
+
+    details = metadata_details(canonical, session_meta_records, invalid_session_meta_records)
+    return SessionInventory(
+        path=normalize_path(path),
+        metrics=metrics,
+        tasks=tasks,
+        unbound_anchors=unbound_anchors,
+        unbound_workdirs=unbound_workdirs,
+        locator_hits=locator_hits,
+        **details,
+    )
+
+
+def build_session_inventory(
+    codex_home: Path,
+    start: datetime,
+    end: datetime,
+    session_ids: set[str] | None = None,
+    diagnostics: CollectorDiagnostics | None = None,
+    match_terms: list[str] | tuple[str, ...] = (),
+) -> SessionScanResult:
+    sessions_root = codex_home / "sessions"
+    requested = tuple(sorted(session_ids or set()))
+    if not sessions_root.exists():
+        if diagnostics:
+            diagnostics.source("sessions").unavailable("sessions source directory does not exist")
+        return SessionScanResult([], "unavailable", requested, 0, 0, False)
+
+    all_paths = sorted(sessions_root.rglob("*.jsonl"))
+    candidate_paths = all_paths
+    strategy = "full_scan"
+    fallback_used = False
+    if requested:
+        filename_matches = [
+            path
+            for path in all_paths
+            if any(session_id in path.stem for session_id in requested)
+        ]
+        if filename_matches:
+            candidate_paths = filename_matches
+            strategy = "session_id_filename_fast_path"
+        else:
+            strategy = "session_id_full_scan_fallback"
+            fallback_used = True
+
+    inventories = [
+        inventory
+        for path in candidate_paths
+        if (inventory := scan_session_file(path, start, end, diagnostics, match_terms)) is not None
+    ]
+    matching = [
+        inventory
+        for inventory in inventories
+        if not requested or session_matches(inventory.session_id, set(requested))
+    ]
+
+    if requested and strategy == "session_id_filename_fast_path" and not matching:
+        fallback_used = True
+        strategy = "session_id_validation_fallback"
+        already_read = {inventory.path for inventory in inventories}
+        for path in all_paths:
+            if normalize_path(path) in already_read:
+                continue
+            inventory = scan_session_file(path, start, end, diagnostics, match_terms)
+            if inventory is not None:
+                inventories.append(inventory)
+        matching = [
+            inventory
+            for inventory in inventories
+            if session_matches(inventory.session_id, set(requested))
+        ]
+
+    return SessionScanResult(
+        matching if requested else inventories,
+        strategy,
+        requested,
+        len(all_paths),
+        len(inventories),
+        fallback_used,
+    )
 
 
 def session_scope_match(
@@ -889,8 +1419,9 @@ def session_scope_match(
         if not call:
             continue
         for workdir in call["workdirs"]:
-            if path_is_under(workdir, cwd_root):
-                return {"reason": "tool_workdir", "matched_path": workdir}
+            resolved_workdir = resolve_tool_workdir(workdir, meta_cwd)
+            if resolved_workdir and path_is_under(resolved_workdir, cwd_root):
+                return {"reason": "tool_workdir", "matched_path": resolved_workdir}
     return None
 
 
@@ -911,6 +1442,8 @@ def collect_history(
     local_tz: ZoneInfo,
     limit: int,
     session_ids: set[str] | None = None,
+    session_windows: dict[str, list[tuple[datetime, datetime]] | None] | None = None,
+    match_terms: list[str] | tuple[str, ...] = (),
     diagnostics: CollectorDiagnostics | None = None,
 ) -> list[dict[str, Any]]:
     history_path = codex_home / "history.jsonl"
@@ -923,6 +1456,22 @@ def collect_history(
         session_id = str(obj.get("session_id") or "")
         if session_ids is not None and not session_matches(session_id, session_ids):
             continue
+        if match_terms and not matches_terms([session_id, text], match_terms):
+            continue
+        if session_windows is not None:
+            matching_window = next(
+                (
+                    windows
+                    for selected_id, windows in session_windows.items()
+                    if session_matches(session_id, {selected_id})
+                ),
+                [],
+            )
+            if matching_window is not None and not any(
+                window_start <= ts <= window_end
+                for window_start, window_end in matching_window
+            ):
+                continue
         secret_context = bool(SECRET_CONTEXT_RE.search(text))
         entries.append(
             {
@@ -966,6 +1515,245 @@ def collect_history_activity_events(
     return events
 
 
+def combine_metrics(metrics_rows: list[ScopeMetrics]) -> ScopeMetrics:
+    combined = ScopeMetrics()
+    for metrics in metrics_rows:
+        combined.events += metrics.events
+        combined.user_events += metrics.user_events
+        combined.tool_call_records += metrics.tool_call_records
+        combined.tool_invocations_estimate += metrics.tool_invocations_estimate
+        combined.unresolved_tool_call_records += metrics.unresolved_tool_call_records
+        combined.invocation_unresolved_records += metrics.invocation_unresolved_records
+        combined.workdir_unresolved_records += metrics.workdir_unresolved_records
+        combined.syntax_dynamic_uncertain_records += metrics.syntax_dynamic_uncertain_records
+        combined.explicit_workdir_records += metrics.explicit_workdir_records
+        combined.session_cwd_fallback_records += metrics.session_cwd_fallback_records
+        for record_type, count in metrics.records_by_type.items():
+            combined.records_by_type[record_type] += count
+        combined.tool_workdirs.update(metrics.tool_workdirs)
+        if metrics.first_event is not None:
+            combined.first_event = (
+                metrics.first_event
+                if combined.first_event is None
+                else min(combined.first_event, metrics.first_event)
+            )
+        if metrics.last_event is not None:
+            combined.last_event = (
+                metrics.last_event
+                if combined.last_event is None
+                else max(combined.last_event, metrics.last_event)
+            )
+    return combined
+
+
+def selection_metrics(selection: SessionSelection) -> ScopeMetrics:
+    if selection.task_indexes is None:
+        return selection.inventory.metrics
+    return combine_metrics(
+        [selection.inventory.tasks[index].metrics for index in selection.task_indexes]
+    )
+
+
+def full_session_selection(
+    inventory: SessionInventory,
+    reason: str,
+) -> SessionSelection:
+    return SessionSelection(
+        inventory,
+        {"reason": reason, "matched_path": ""},
+        None,
+        "full_session",
+    )
+
+
+def project_session_selection(
+    inventory: SessionInventory,
+    cwd_root: Path,
+) -> SessionSelection | None:
+    metadata_match = bool(inventory.cwd and path_is_under(inventory.cwd, cwd_root))
+    matching_indexes: list[int] = []
+    matching_workdirs: set[str] = set()
+    for index, task in enumerate(inventory.tasks):
+        if not task.metrics.events:
+            continue
+        task_matches = {
+            resolved
+            for workdir in task.metrics.tool_workdirs
+            if (resolved := resolve_tool_workdir(workdir, inventory.cwd)) is not None
+            and path_is_under(resolved, cwd_root)
+        }
+        if metadata_match or task_matches:
+            matching_indexes.append(index)
+            matching_workdirs.update(task_matches)
+
+    unbound_matches = {
+        resolved
+        for workdir in inventory.unbound_workdirs
+        if (resolved := resolve_tool_workdir(workdir, inventory.cwd)) is not None
+        and path_is_under(resolved, cwd_root)
+    }
+    if not metadata_match and not matching_indexes and not unbound_matches:
+        return None
+
+    if metadata_match:
+        scope_match = {"reason": "metadata_cwd", "matched_path": inventory.cwd}
+    else:
+        matched_path = min(matching_workdirs | unbound_matches)
+        scope_match = {"reason": "tool_workdir", "matched_path": matched_path}
+    history_binding = "task_bound" if matching_indexes else "unbound_suppressed"
+    return SessionSelection(
+        inventory,
+        scope_match,
+        tuple(matching_indexes),
+        history_binding,
+        normalize_path(cwd_root),
+    )
+
+
+def history_windows_for_selections(
+    selections: list[SessionSelection],
+) -> dict[str, list[tuple[datetime, datetime]] | None]:
+    windows_by_session: dict[str, list[tuple[datetime, datetime]] | None] = {}
+    for selection in selections:
+        session_id = selection.inventory.session_id
+        if selection.task_indexes is None:
+            windows_by_session[session_id] = None
+            continue
+        if windows_by_session.get(session_id) is None and session_id in windows_by_session:
+            continue
+        windows = windows_by_session.setdefault(session_id, [])
+        assert windows is not None
+        for index in selection.task_indexes:
+            task = selection.inventory.tasks[index]
+            task_end = task.end or task.metrics.last_event or task.start
+            if task_end >= task.start:
+                windows.append(
+                    (
+                        task.start - timedelta(seconds=TASK_HISTORY_PRELUDE_SECONDS),
+                        task_end,
+                    )
+                )
+    return windows_by_session
+
+
+def inventory_scope_match(
+    inventory: SessionInventory,
+    cwd_root: Path,
+) -> dict[str, str] | None:
+    selection = project_session_selection(inventory, cwd_root)
+    return selection.scope_match if selection else None
+
+
+def tool_activity_from_metrics(metrics: ScopeMetrics) -> dict[str, Any]:
+    workdirs = sorted(metrics.tool_workdirs)
+    return {
+        "call_records": metrics.tool_call_records,
+        "invocations_estimate": metrics.tool_invocations_estimate,
+        "invocations_estimate_kind": "syntactic_call_site_estimate",
+        "unresolved_records": metrics.unresolved_tool_call_records,
+        "records_by_type": dict(metrics.records_by_type),
+        "workdir_attribution": {
+            "explicit_records": metrics.explicit_workdir_records,
+            "session_cwd_fallback_records": metrics.session_cwd_fallback_records,
+            "unresolved_records": metrics.workdir_unresolved_records,
+            "paths": workdirs,
+        },
+        "parser_resolution": {
+            "invocation": {
+                "resolved_records": (
+                    metrics.tool_call_records - metrics.invocation_unresolved_records
+                ),
+                "unresolved_records": metrics.invocation_unresolved_records,
+            },
+            "workdir": {
+                "explicit_records": metrics.explicit_workdir_records,
+                "session_cwd_fallback_records": metrics.session_cwd_fallback_records,
+                "unresolved_records": metrics.workdir_unresolved_records,
+            },
+            "syntax_dynamic_uncertain_records": metrics.syntax_dynamic_uncertain_records,
+        },
+    }
+
+
+def session_from_selection(
+    selection: SessionSelection,
+    local_tz: ZoneInfo,
+) -> dict[str, Any]:
+    inventory = selection.inventory
+    scope_match = selection.scope_match
+    metrics = selection_metrics(selection)
+    start_ts = parse_event_ts(inventory.canonical.get("timestamp"))
+    tool_activity = tool_activity_from_metrics(metrics)
+    matched_path = scope_match["matched_path"]
+    return {
+        "session": inventory.session_id[:8],
+        "session_id": inventory.session_id,
+        "started": start_ts.astimezone(local_tz).isoformat(timespec="minutes") if start_ts else "",
+        "first_event": metrics.first_event.astimezone(local_tz).isoformat(timespec="minutes") if metrics.first_event else "",
+        "last_event": metrics.last_event.astimezone(local_tz).isoformat(timespec="minutes") if metrics.last_event else "",
+        "cwd": inventory.cwd,
+        "events": metrics.events,
+        "user_events": metrics.user_events,
+        "tool_calls": metrics.tool_call_records,
+        "file": str(inventory.path),
+        "identity_source": "first_session_meta" if inventory.session_meta_records else "filename_fallback",
+        "session_meta_records": inventory.session_meta_records,
+        "invalid_session_meta_records": inventory.invalid_session_meta_records,
+        "parent_session_id": inventory.parent_session_id,
+        "forked_from_session_id": inventory.forked_from_id,
+        "forked_from_id": inventory.forked_from_id,
+        "thread_source": inventory.thread_source,
+        "agent_path": inventory.agent_path,
+        "spawn_depth": inventory.spawn_depth,
+        "scope_match": scope_match,
+        "match_reason": scope_match["reason"],
+        "matched_workdirs": [matched_path] if matched_path else [],
+        "match_uncertain": (
+            scope_match["reason"] == "tool_workdir"
+            or selection.history_binding == "unbound_suppressed"
+        ),
+        "task_scope": {
+            "mode": selection.history_binding,
+            "matched_tasks": (
+                len(selection.task_indexes)
+                if selection.task_indexes is not None
+                else len([task for task in inventory.tasks if task.metrics.events])
+            ),
+            "tasks_in_range": len([task for task in inventory.tasks if task.metrics.events]),
+            "history_previews_bound": selection.history_binding != "unbound_suppressed",
+        },
+        "tool_call_records": metrics.tool_call_records,
+        "tool_invocations_estimate": metrics.tool_invocations_estimate,
+        "tool_workdirs": sorted(metrics.tool_workdirs),
+        "unresolved_tool_call_records": metrics.unresolved_tool_call_records,
+        "tool_activity": tool_activity,
+    }
+
+
+def sessions_from_inventory(
+    inventories: list[SessionInventory],
+    local_tz: ZoneInfo,
+    session_ids: set[str] | None = None,
+    cwd_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    for inventory in inventories:
+        if inventory.metrics.events == 0:
+            continue
+        if session_ids is not None and not session_matches(inventory.session_id, session_ids):
+            continue
+        if cwd_root is not None:
+            selection = project_session_selection(inventory, cwd_root)
+            if selection is None:
+                continue
+        elif session_ids is not None:
+            selection = full_session_selection(inventory, "session_id")
+        else:
+            selection = full_session_selection(inventory, "time_range")
+        sessions.append(session_from_selection(selection, local_tz))
+    return sessions
+
+
 def collect_sessions(
     codex_home: Path,
     start: datetime,
@@ -975,118 +1763,101 @@ def collect_sessions(
     cwd_root: Path | None = None,
     diagnostics: CollectorDiagnostics | None = None,
 ) -> list[dict[str, Any]]:
-    sessions_root = codex_home / "sessions"
-    sessions: list[dict[str, Any]] = []
-    if not sessions_root.exists():
-        if diagnostics:
-            diagnostics.source("sessions").unavailable("sessions source directory does not exist")
-        return sessions
+    scan = build_session_inventory(codex_home, start, end, session_ids, diagnostics)
+    return sessions_from_inventory(scan.inventories, local_tz, session_ids, cwd_root)
 
-    for path in sorted(sessions_root.rglob("*.jsonl")):
-        rows = read_jsonl(path, diagnostics, "sessions")
-        if not rows:
+
+def activity_events_from_selections(
+    selections: list[SessionSelection],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    git_root_cache: dict[str, Path | None] = {}
+
+    def cached_git_root(path_value: str) -> Path | None:
+        if not path_value:
+            return None
+        if path_value not in git_root_cache:
+            git_root_cache[path_value] = find_git_root(Path(path_value))
+        return git_root_cache[path_value]
+
+    for selection in selections:
+        inventory = selection.inventory
+        project_root = cached_git_root(inventory.cwd)
+        project = project_root.name if project_root else (Path(inventory.cwd).name if inventory.cwd else "unknown")
+        if selection.task_indexes is None:
+            anchors = [anchor for task in inventory.tasks for anchor in task.anchors]
+            anchors.extend(inventory.unbound_anchors)
+        elif selection.history_binding == "unbound_suppressed":
+            anchors = inventory.unbound_anchors
+        else:
+            anchors = [
+                anchor
+                for index in selection.task_indexes
+                for anchor in inventory.tasks[index].anchors
+            ]
+        for anchor in anchors:
+            if selection.project_root is not None:
+                matching_anchor_workdirs = tuple(
+                    resolved
+                    for workdir in anchor.workdirs
+                    if (
+                        resolved := resolve_tool_workdir(workdir, inventory.cwd)
+                    )
+                    is not None
+                    and path_is_under(resolved, selection.project_root)
+                )
+                event_cwds = matching_anchor_workdirs or (
+                    (selection.scope_match["matched_path"],)
+                    if selection.scope_match["matched_path"]
+                    else ()
+                )
+            else:
+                resolved_anchor_workdirs = tuple(
+                    resolved
+                    for workdir in anchor.workdirs
+                    if (resolved := resolve_tool_workdir(workdir, inventory.cwd))
+                    is not None
+                )
+                event_cwds = resolved_anchor_workdirs or (
+                    (inventory.cwd,) if inventory.cwd else ()
+                )
+            for event_cwd in dict.fromkeys(str(item) for item in event_cwds if item):
+                event_project_root = cached_git_root(event_cwd)
+                event_project = event_project_root.name if event_project_root else project
+                events.append(
+                    {
+                        "timestamp": iso_utc(anchor.timestamp),
+                        "session_id": inventory.session_id,
+                        "source": "session",
+                        "project": event_project,
+                        "cwd": event_cwd,
+                    }
+                )
+    return events
+
+
+def activity_events_from_inventory(
+    inventories: list[SessionInventory],
+    session_ids: set[str] | None = None,
+    cwd_root: Path | None = None,
+) -> list[dict[str, Any]]:
+    selections: list[SessionSelection] = []
+    for inventory in inventories:
+        if not inventory.metrics.events:
             continue
-        meta_info = canonical_session_metadata(rows)
-        meta = meta_info["canonical"]
-        events_in_range = 0
-        user_events = 0
-        tool_call_records = 0
-        tool_invocations_estimate = 0
-        unresolved_tool_call_records = 0
-        records_by_type = {"function_call": 0, "custom_tool_call": 0}
-        explicit_workdir_records = 0
-        session_cwd_fallback_records = 0
-        tool_workdirs: list[str] = []
-        first_event: datetime | None = None
-        last_event: datetime | None = None
-
-        for obj in rows:
-            ts = parse_event_ts(obj.get("timestamp"))
-            if not in_range(ts, start, end):
-                continue
-            events_in_range += 1
-            first_event = ts if first_event is None else min(first_event, ts)  # type: ignore[arg-type]
-            last_event = ts if last_event is None else max(last_event, ts)  # type: ignore[arg-type]
-            payload = obj.get("payload") or {}
-            if obj.get("type") == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
-                user_events += 1
-            call = parse_tool_record(payload) if obj.get("type") == "response_item" and isinstance(payload, dict) else None
-            if call:
-                tool_call_records += 1
-                tool_invocations_estimate += int(call["invocations_estimate"])
-                records_by_type[call["record_type"]] += 1
-                tool_workdirs.extend(str(item) for item in call["workdirs"])
-                if not call["resolved"]:
-                    unresolved_tool_call_records += 1
-                elif call["workdirs"]:
-                    explicit_workdir_records += 1
-                else:
-                    session_cwd_fallback_records += 1
-
-        if events_in_range == 0:
-            continue
-
-        start_ts = parse_event_ts(meta.get("timestamp"))
-        full_session_id = str(meta.get("id") or path.stem)
-        cwd = str(meta.get("cwd") or "")
-        if session_ids is not None and not session_matches(full_session_id, session_ids):
+        if session_ids is not None and not session_matches(inventory.session_id, session_ids):
             continue
         if cwd_root is not None:
-            scope_match = session_scope_match(rows, cwd, cwd_root, start, end)
-            if scope_match is None:
+            selection = project_session_selection(inventory, cwd_root)
+            if selection is None:
                 continue
-        elif session_ids is not None:
-            scope_match = {"reason": "session_id", "matched_path": ""}
         else:
-            scope_match = {"reason": "time_range", "matched_path": ""}
-        tool_workdirs = sorted(set(tool_workdirs))
-        workdir_attribution = {
-            "explicit_records": explicit_workdir_records,
-            "session_cwd_fallback_records": session_cwd_fallback_records,
-            "unresolved_records": unresolved_tool_call_records,
-            "paths": tool_workdirs,
-        }
-        tool_activity = {
-            "call_records": tool_call_records,
-            "invocations_estimate": tool_invocations_estimate,
-            "invocations_estimate_kind": "syntactic_call_site_estimate",
-            "unresolved_records": unresolved_tool_call_records,
-            "records_by_type": records_by_type,
-            "workdir_attribution": workdir_attribution,
-        }
-        sessions.append(
-            {
-                "session": full_session_id[0:8],
-                "session_id": full_session_id,
-                "started": start_ts.astimezone(local_tz).isoformat(timespec="minutes") if start_ts else "",
-                "first_event": first_event.astimezone(local_tz).isoformat(timespec="minutes") if first_event else "",
-                "last_event": last_event.astimezone(local_tz).isoformat(timespec="minutes") if last_event else "",
-                "cwd": cwd,
-                "events": events_in_range,
-                "user_events": user_events,
-                "tool_calls": tool_call_records,
-                "file": str(path),
-                "identity_source": "first_session_meta" if meta_info["session_meta_records"] else "filename_fallback",
-                "session_meta_records": meta_info["session_meta_records"],
-                "invalid_session_meta_records": meta_info["invalid_session_meta_records"],
-                "parent_session_id": meta_info["parent_session_id"],
-                "forked_from_session_id": meta_info["forked_from_id"],
-                "forked_from_id": meta_info["forked_from_id"],
-                "thread_source": meta_info["thread_source"],
-                "agent_path": meta_info["agent_path"],
-                "spawn_depth": meta_info["spawn_depth"],
-                "scope_match": scope_match,
-                "match_reason": scope_match["reason"],
-                "matched_workdirs": [scope_match["matched_path"]] if scope_match["matched_path"] else [],
-                "match_uncertain": scope_match["reason"] == "tool_workdir",
-                "tool_call_records": tool_call_records,
-                "tool_invocations_estimate": tool_invocations_estimate,
-                "tool_workdirs": tool_workdirs,
-                "unresolved_tool_call_records": unresolved_tool_call_records,
-                "tool_activity": tool_activity,
-            }
-        )
-    return sessions
+            selection = full_session_selection(
+                inventory,
+                "session_id" if session_ids is not None else "time_range",
+            )
+        selections.append(selection)
+    return activity_events_from_selections(selections)
 
 
 def collect_session_activity_events(
@@ -1097,61 +1868,8 @@ def collect_session_activity_events(
     cwd_root: Path | None = None,
     diagnostics: CollectorDiagnostics | None = None,
 ) -> list[dict[str, Any]]:
-    sessions_root = codex_home / "sessions"
-    events: list[dict[str, Any]] = []
-    if not sessions_root.exists():
-        if diagnostics:
-            diagnostics.source("sessions").unavailable("sessions source directory does not exist")
-        return events
-
-    git_root_cache: dict[str, Path | None] = {}
-
-    def cached_git_root(path_value: str) -> Path | None:
-        if not path_value:
-            return None
-        if path_value not in git_root_cache:
-            git_root_cache[path_value] = find_git_root(Path(path_value))
-        return git_root_cache[path_value]
-
-    for path in sorted(sessions_root.rglob("*.jsonl")):
-        rows = read_jsonl(path, diagnostics, "sessions")
-        if not rows:
-            continue
-
-        meta = canonical_session_metadata(rows)["canonical"]
-
-        full_session_id = str(meta.get("id") or path.stem)
-        cwd = str(meta.get("cwd") or "")
-        if session_ids is not None and not session_matches(full_session_id, session_ids):
-            continue
-        if cwd_root is not None and not session_touches_cwd_root(rows, cwd, cwd_root, start, end):
-            continue
-
-        project_root = cached_git_root(cwd)
-        project = project_root.name if project_root else (Path(cwd).name if cwd else "unknown")
-
-        for obj in rows:
-            ts = parse_event_ts(obj.get("timestamp"))
-            if not in_range(ts, start, end):
-                continue
-            payload = obj.get("payload") or {}
-            call = parse_tool_record(payload) if isinstance(payload, dict) else None
-            event_cwds = call["workdirs"] if call and call["workdirs"] else [cwd]
-            for event_cwd in dict.fromkeys(str(item) for item in event_cwds if item):
-                if cwd_root is not None and not path_is_under(event_cwd, cwd_root):
-                    continue
-                event_project_root = cached_git_root(event_cwd)
-                event_project = event_project_root.name if event_project_root else project
-                events.append(
-                    {
-                        "timestamp": iso_utc(ts),
-                        "session_id": full_session_id,
-                        "source": "session",
-                        "project": event_project,
-                        "cwd": event_cwd,
-                    }
-                )
-    return events
+    scan = build_session_inventory(codex_home, start, end, session_ids, diagnostics)
+    return activity_events_from_inventory(scan.inventories, session_ids, cwd_root)
 
 
 def parse_utc_iso(value: str) -> datetime:
@@ -1514,24 +2232,6 @@ def resolve_scope(args: argparse.Namespace, codex_home: Path, local_tz: ZoneInfo
     session_id = args.session_id or os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
     if session_id and not args.session_id:
         warnings.append("using session_id from CODEX_THREAD_ID/CODEX_SESSION_ID environment")
-    if args.scope in {"local", "session"} and not session_id:
-        session_id = infer_session_id(codex_home, start, end, local_tz, cwd_root=effective_project_root if args.scope == "local" else None)
-        if not session_id and args.scope == "local":
-            session_id = infer_session_id(codex_home, start, end, local_tz)
-            if session_id:
-                warnings.append("inferred session_id from latest session in range without cwd/project match")
-        if session_id:
-            warnings.append(f"inferred session_id={session_id}")
-        else:
-            warnings.append("could not infer a current Codex session_id for this scope")
-
-    if args.scope == "session" and not args.start and session_id:
-        broad_start = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        matched = collect_sessions(codex_home, broad_start, end, local_tz, session_ids={session_id})
-        if matched:
-            started = matched[0].get("started")
-            if started:
-                start = parse_dt(str(started), local_tz, is_end=False)
 
     if end < start:
         raise SystemExit("error: --end must be after --start")
@@ -1550,11 +2250,121 @@ def resolve_scope(args: argparse.Namespace, codex_home: Path, local_tz: ZoneInfo
     }
 
 
+def infer_session_id_from_inventory(
+    inventories: list[SessionInventory],
+    cwd_root: Path | None = None,
+) -> str | None:
+    candidates = [
+        inventory
+        for inventory in inventories
+        if inventory.metrics.events
+        and (cwd_root is None or inventory_scope_match(inventory, cwd_root) is not None)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda inventory: inventory.metrics.last_event or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return candidates[0].session_id
+
+
 def current_script_sha256() -> str:
     try:
         return hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()
     except OSError:
         return ""
+
+
+def enabled_sources(args: argparse.Namespace) -> set[str]:
+    if args.sources:
+        return set(args.sources)
+    if args.mode == "locate":
+        return {"history", "sessions", "rollout_summaries"}
+    return set(SOURCE_NAMES)
+
+
+def selection_locator_hits(selection: SessionSelection) -> list[LocatorHit]:
+    if selection.task_indexes is None:
+        return selection.inventory.locator_hits
+    turn_ids = {
+        selection.inventory.tasks[index].turn_id
+        for index in selection.task_indexes
+    }
+    if selection.history_binding == "unbound_suppressed":
+        return [hit for hit in selection.inventory.locator_hits if not hit.turn_id]
+    return [hit for hit in selection.inventory.locator_hits if hit.turn_id in turn_ids]
+
+
+def build_locator_summary(
+    selections: list[SessionSelection],
+    history: list[dict[str, Any]],
+    sources: set[str],
+) -> dict[str, Any]:
+    history_session_ids = {str(item["session_id"]) for item in history}
+    candidates: list[dict[str, Any]] = []
+    represented_session_ids: set[str] = set()
+    for selection in selections:
+        hits = selection_locator_hits(selection)
+        inventory = selection.inventory
+        if not hits and not any(
+            session_matches(inventory.session_id, {history_id})
+            for history_id in history_session_ids
+        ):
+            continue
+        represented_session_ids.add(inventory.session_id)
+        task_rows: list[dict[str, Any]] = []
+        for task in inventory.tasks:
+            task_hits = [hit for hit in hits if hit.turn_id == task.turn_id]
+            if not task_hits:
+                continue
+            task_rows.append(
+                {
+                    "turn_id": task.turn_id,
+                    "start_utc": iso_utc(task.start),
+                    "end_utc": iso_utc(task.end) if task.end else "",
+                    "hit_count": len(task_hits),
+                    "hit_kinds": sorted({hit.kind for hit in task_hits}),
+                }
+            )
+        hit_timestamps = [hit.timestamp for hit in hits if hit.timestamp is not None]
+        candidates.append(
+            {
+                "session_id": inventory.session_id,
+                "cwd": inventory.cwd,
+                "file": str(inventory.path),
+                "scope_match": selection.scope_match,
+                "history_binding": selection.history_binding,
+                "hit_count": len(hits),
+                "hit_kinds": sorted({hit.kind for hit in hits}),
+                "last_hit_utc": iso_utc(max(hit_timestamps)) if hit_timestamps else "",
+                "tasks": task_rows,
+            }
+        )
+    candidates.sort(
+        key=lambda candidate: (candidate["hit_count"], candidate["last_hit_utc"]),
+        reverse=True,
+    )
+    for rank, candidate in enumerate(candidates, 1):
+        candidate["rank"] = rank
+    history_only_ids = sorted(
+        history_id
+        for history_id in history_session_ids
+        if not any(
+            session_matches(history_id, {represented})
+            for represented in represented_session_ids
+        )
+    )
+    return {
+        "query": {
+            "term_count": 0,
+            "terms_included": False,
+            "sources": [name for name in SOURCE_NAMES if name in sources],
+        },
+        "candidate_count": len(candidates) + len(history_only_ids),
+        "candidates": candidates,
+        "history_only_session_ids": history_only_ids,
+    }
 
 
 def finalize_diagnostics(
@@ -1588,12 +2398,31 @@ def finalize_diagnostics(
     call_records = 0
     invocations_estimate = 0
     unresolved_records = 0
+    invocation_unresolved_records = 0
+    explicit_workdir_records = 0
+    fallback_workdir_records = 0
+    workdir_unresolved_records = 0
+    syntax_dynamic_uncertain_records = 0
     recognized_workdirs: set[str] = set()
     for session in sessions:
         tool_activity = session["tool_activity"]
         call_records += int(tool_activity["call_records"])
         invocations_estimate += int(tool_activity["invocations_estimate"])
         unresolved_records += int(tool_activity["unresolved_records"])
+        parser_resolution = tool_activity["parser_resolution"]
+        invocation_unresolved_records += int(
+            parser_resolution["invocation"]["unresolved_records"]
+        )
+        explicit_workdir_records += int(parser_resolution["workdir"]["explicit_records"])
+        fallback_workdir_records += int(
+            parser_resolution["workdir"]["session_cwd_fallback_records"]
+        )
+        workdir_unresolved_records += int(
+            parser_resolution["workdir"]["unresolved_records"]
+        )
+        syntax_dynamic_uncertain_records += int(
+            parser_resolution["syntax_dynamic_uncertain_records"]
+        )
         for record_type, count in tool_activity["records_by_type"].items():
             records_by_type[record_type] += int(count)
         recognized_workdirs.update(tool_activity["workdir_attribution"]["paths"])
@@ -1611,6 +2440,18 @@ def finalize_diagnostics(
                 "unresolved_records": unresolved_records,
                 "records_by_type": records_by_type,
                 "recognized_workdirs": len(recognized_workdirs),
+                "resolution": {
+                    "invocation": {
+                        "resolved_records": call_records - invocation_unresolved_records,
+                        "unresolved_records": invocation_unresolved_records,
+                    },
+                    "workdir": {
+                        "explicit_records": explicit_workdir_records,
+                        "session_cwd_fallback_records": fallback_workdir_records,
+                        "unresolved_records": workdir_unresolved_records,
+                    },
+                    "syntax_dynamic_uncertain_records": syntax_dynamic_uncertain_records,
+                },
             },
         }
     )
@@ -1633,95 +2474,246 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         ) from exc
 
     diagnostics = CollectorDiagnostics()
+    sources = enabled_sources(args)
+    for source_name in SOURCE_NAMES:
+        if source_name not in sources:
+            diagnostics.source(source_name).skip("source_filter")
     scope = resolve_scope(args, codex_home, local_tz)
     start = scope["start"]
     end = scope["end"]
 
+    # A known session ID can be resolved from its rollout filename and scanned
+    # directly. Session scope without an explicit start scans the selected
+    # session from its beginning, while every other scope keeps the requested
+    # time window.
+    requested_scan_ids = (
+        {scope["session_id"]}
+        if args.scope == "session" and scope["session_id"]
+        else None
+    )
+    scan_start = (
+        datetime(1970, 1, 1, tzinfo=timezone.utc)
+        if args.scope == "session" and not args.start
+        else start
+    )
+    if "sessions" in sources:
+        session_scan = build_session_inventory(
+            codex_home,
+            scan_start,
+            end,
+            requested_scan_ids,
+            diagnostics,
+            args.match if args.mode == "locate" else (),
+        )
+    else:
+        session_scan = SessionScanResult(
+            [], "source_filter", tuple(sorted(requested_scan_ids or set())), 0, 0, False
+        )
+
+    if args.scope in {"local", "session"} and not scope["session_id"]:
+        inferred = infer_session_id_from_inventory(
+            session_scan.inventories,
+            Path(scope["project_root"]) if args.scope == "local" else None,
+        )
+        if not inferred and args.scope == "local":
+            inferred = infer_session_id_from_inventory(session_scan.inventories)
+            if inferred:
+                scope["warnings"].append(
+                    "inferred session_id from latest session in range without cwd/project match"
+                )
+        if inferred:
+            scope["session_id"] = inferred
+            scope["warnings"].append(f"inferred session_id={inferred}")
+        else:
+            scope["warnings"].append(
+                "could not infer a current Codex session_id for this scope"
+            )
+
+    if args.scope == "session" and not args.start and scope["session_id"]:
+        selected_for_start = next(
+            (
+                inventory
+                for inventory in session_scan.inventories
+                if session_matches(inventory.session_id, {scope["session_id"]})
+            ),
+            None,
+        )
+        if selected_for_start:
+            session_started = parse_event_ts(selected_for_start.canonical.get("timestamp"))
+            if session_started:
+                start = session_started
+                scope["start"] = start
+
+    scope["session_scan"] = {
+        "strategy": session_scan.strategy,
+        "files_available": session_scan.files_available,
+        "files_read": session_scan.files_read,
+        "fallback_used": session_scan.fallback_used,
+    }
+
     selected_session_ids: set[str] | None = None
-    session_cwd_root: Path | None = None
     selected_repo_roots = repo_roots
     summary_terms: list[str] | None = None
     notes_terms: list[str] | None = None
+    selected: list[SessionSelection] = []
 
     if args.scope == "global":
         scope["notes_mode"] = "all_in_range"
+        selected = [
+            full_session_selection(inventory, "time_range")
+            for inventory in session_scan.inventories
+            if inventory.metrics.events
+        ]
     elif args.scope == "session":
         scope["notes_mode"] = "disabled"
         selected_session_ids = {scope["session_id"]} if scope["session_id"] else set()
         selected_repo_roots = [Path(scope["project_root"])]
         summary_terms = [Path(scope["project_root"]).name, scope["session_id"]]
+        selected = [
+            full_session_selection(inventory, "session_id")
+            for inventory in session_scan.inventories
+            if inventory.metrics.events
+            and session_matches(inventory.session_id, selected_session_ids)
+        ]
     elif args.scope == "project":
         scope["notes_mode"] = "project_terms"
-        session_cwd_root = Path(scope["project_root"])
-        project_sessions = collect_sessions(codex_home, start, end, local_tz, cwd_root=session_cwd_root)
-        selected_session_ids = {str(session["session_id"]) for session in project_sessions}
+        project_root = Path(scope["project_root"])
+        selected = [
+            selection
+            for inventory in session_scan.inventories
+            if inventory.metrics.events
+            and (selection := project_session_selection(inventory, project_root))
+            is not None
+        ]
+        selected_session_ids = {selection.inventory.session_id for selection in selected}
         selected_repo_roots = [Path(scope["project_root"])]
         summary_terms = [Path(scope["project_root"]).name]
         notes_terms = summary_terms
     else:
         scope["notes_mode"] = "project_terms"
         local_ids = {scope["session_id"]} if scope["session_id"] else set()
-        project_sessions = collect_sessions(codex_home, start, end, local_tz, cwd_root=Path(scope["project_root"]))
-        local_ids.update(str(session["session_id"]) for session in project_sessions)
+        project_root = Path(scope["project_root"])
+        for inventory in session_scan.inventories:
+            if not inventory.metrics.events:
+                continue
+            if session_matches(inventory.session_id, local_ids):
+                selected.append(full_session_selection(inventory, "session_id"))
+                continue
+            project_selection = project_session_selection(inventory, project_root)
+            if project_selection is not None:
+                selected.append(project_selection)
+                local_ids.add(inventory.session_id)
         selected_session_ids = local_ids
         selected_repo_roots = [Path(scope["project_root"])]
         summary_terms = [Path(scope["project_root"]).name, scope["session_id"]]
         notes_terms = summary_terms
 
-    activity_events = collect_session_activity_events(
-        codex_home,
-        start,
-        end,
-        session_ids=selected_session_ids,
-        cwd_root=session_cwd_root,
-        diagnostics=diagnostics,
-    )
-    if not activity_events:
-        activity_events = collect_history_activity_events(
+    if "history" in sources:
+        history = collect_history(
             codex_home,
             start,
             end,
+            local_tz,
+            args.prompt_preview_chars,
             session_ids=selected_session_ids,
+            session_windows=(
+                None
+                if args.scope in {"global", "session"}
+                else history_windows_for_selections(selected)
+            ),
+            match_terms=args.match if args.mode == "locate" else (),
             diagnostics=diagnostics,
         )
+    else:
+        history = []
 
-    history = collect_history(
-        codex_home,
-        start,
-        end,
-        local_tz,
-        args.prompt_preview_chars,
-        session_ids=selected_session_ids,
-        diagnostics=diagnostics,
-    )
-    sessions = collect_sessions(
-        codex_home,
-        start,
-        end,
-        local_tz,
-        session_ids=selected_session_ids,
-        cwd_root=session_cwd_root,
-        diagnostics=diagnostics,
-    )
-    rollout_summaries = collect_rollout_summaries(
-        codex_home,
-        start,
-        end,
-        local_tz,
-        match_terms=summary_terms,
-        diagnostics=diagnostics,
-    )
-    git_activity = collect_git(selected_repo_roots, start, end, diagnostics)
-    if args.scope == "session":
+    if args.mode == "locate":
+        history_session_ids = {str(item["session_id"]) for item in history}
+        selected = [
+            selection
+            for selection in selected
+            if selection_locator_hits(selection)
+            or any(
+                session_matches(selection.inventory.session_id, {history_id})
+                for history_id in history_session_ids
+            )
+        ]
+    activity_events = activity_events_from_selections(selected)
+    if not activity_events:
+        activity_events = [
+            {
+                "timestamp": iso_utc(timestamp),
+                "session_id": item["session_id"],
+                "source": "history",
+                "project": "",
+                "cwd": "",
+            }
+            for item in history
+            if (timestamp := parse_event_ts(item["local_time"])) is not None
+        ]
+    sessions = [session_from_selection(selection, local_tz) for selection in selected]
+    if "rollout_summaries" in sources:
+        rollout_summaries = collect_rollout_summaries(
+            codex_home,
+            start,
+            end,
+            local_tz,
+            match_terms=(args.match if args.mode == "locate" else summary_terms),
+            diagnostics=diagnostics,
+        )
+    else:
+        rollout_summaries = []
+    if "git" in sources:
+        git_activity = collect_git(selected_repo_roots, start, end, diagnostics)
+        if args.mode == "locate":
+            git_activity = {
+                repo: [
+                    commit
+                    for commit in commits
+                    if matches_terms(
+                        [
+                            repo,
+                            str(commit["subject"]),
+                            str(commit["author"]["name"]),
+                            str(commit["committer"]["name"]),
+                        ],
+                        args.match,
+                    )
+                ]
+                for repo, commits in git_activity.items()
+            }
+            git_activity = {repo: commits for repo, commits in git_activity.items() if commits}
+    else:
+        git_activity = {}
+    if "notes" not in sources:
+        notes = []
+    elif args.scope == "session":
         diagnostics.source("notes").skip("session_scope_unbound")
         notes: list[dict[str, str]] = []
     else:
-        notes = collect_notes(notes_root, start, end, local_tz, match_terms=notes_terms, diagnostics=diagnostics)
+        notes = collect_notes(
+            notes_root,
+            start,
+            end,
+            local_tz,
+            match_terms=(args.match if args.mode == "locate" else notes_terms),
+            diagnostics=diagnostics,
+        )
     work_time_estimate = estimate_work_time(activity_events, local_tz, args.activity_gap_minutes)
     collector_diagnostics = finalize_diagnostics(diagnostics, sessions)
+    locator = (
+        build_locator_summary(selected, history, sources)
+        if args.mode == "locate"
+        else None
+    )
+    if locator is not None:
+        locator["query"]["term_count"] = len(
+            [term for term in args.match if term.strip()]
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
+        "mode": args.mode,
         "collector": {
             "name": "codex-session-analysis",
             "version": COLLECTOR_VERSION,
@@ -1735,6 +2727,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             "secret_context_previews_suppressed": sum(1 for item in history if item["preview_suppressed"]),
         },
         "machine": args.machine,
+        "sources_enabled": [name for name in SOURCE_NAMES if name in sources],
         "scope": {
             key: value
             for key, value in scope.items()
@@ -1765,10 +2758,76 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "notes": notes,
         "work_time_estimate": work_time_estimate,
         "diagnostics": collector_diagnostics,
+        "locator": locator,
     }
 
 
+def emit_locator_markdown(payload: dict[str, Any]) -> None:
+    locator = payload["locator"]
+    collector = payload["collector"]
+    report_range = payload["range"]
+    print("# Codex Session Locator")
+    print()
+    print(
+        f"- Provenance: schema v{payload['schema_version']}; {collector['name']} "
+        f"{collector['version']}; `{collector['script_sha256']}`; coverage={payload['diagnostics']['status']}"
+    )
+    print(f"- Scope: {payload['scope']['effective']}")
+    print(
+        f"- Range: {report_range['start_local']} to {report_range['end_local']} "
+        f"({report_range['timezone']})"
+    )
+    print(f"- Sources: {', '.join(locator['query']['sources'])}")
+    print(
+        f"- Query: {locator['query']['term_count']} term(s); terms intentionally omitted from metadata"
+    )
+    print(f"- Candidates: {locator['candidate_count']}")
+    print()
+    print("## Session And Task Candidates")
+    print()
+    if not locator["candidates"]:
+        print("No session-backed candidates found.")
+    for candidate in locator["candidates"]:
+        print(
+            f"- #{candidate['rank']} `{candidate['session_id']}`; cwd={candidate['cwd'] or '(unknown)'}; "
+            f"match={candidate['scope_match']['reason']}; hits={candidate['hit_count']} "
+            f"({', '.join(candidate['hit_kinds']) or 'history'})"
+        )
+        for task in candidate["tasks"]:
+            print(
+                f"  - task `{task['turn_id'] or '(unbound)'}` {task['start_utc']} to "
+                f"{task['end_utc'] or '(open)'}; hits={task['hit_count']} "
+                f"({', '.join(task['hit_kinds'])})"
+            )
+    for session_id in locator["history_only_session_ids"]:
+        print(f"- `{session_id}`; history-only candidate")
+    print()
+    print(f"## Matching Prompt Previews ({len(payload['history'])})")
+    print()
+    for item in payload["history"]:
+        if item["preview_suppressed"]:
+            print(
+                f"- {item['local_time']} session `{item['session']}` "
+                "[secret-context; preview suppressed]"
+            )
+        else:
+            print(f"- {item['local_time']} session `{item['session']}`: {item['text']}")
+    print()
+    print(f"## Matching Rollout Summaries ({len(payload['rollout_summaries'])})")
+    print()
+    for item in payload["rollout_summaries"]:
+        print(f"- {item['local_time']}: {item['title']} ({item['file']})")
+    print()
+    print(
+        "Next step: choose a candidate session ID, then run evidence mode with "
+        "`--scope session --session-id <id> --output <private-path>`."
+    )
+
+
 def emit_markdown(payload: dict[str, Any]) -> None:
+    if payload.get("mode") == "locate":
+        emit_locator_markdown(payload)
+        return
     r = payload["range"]
     paths = payload["paths"]
     scope = payload["scope"]
@@ -1854,6 +2913,7 @@ def emit_markdown(payload: dict[str, Any]) -> None:
             f"{item['cwd'] or '(no cwd)'}; events={item['events']}, user={item['user_events']}, "
             f"tool-call records={item['tool_call_records']}, tool-invocation estimate={item['tool_invocations_estimate']}, "
             f"unresolved tool records={item['unresolved_tool_call_records']}, match={item['match_reason']}, "
+            f"task-scope={item['task_scope']['mode']} ({item['task_scope']['matched_tasks']} matched), "
             f"parent={parent}, forked-from={forked_from}"
         )
     print()
@@ -1906,19 +2966,46 @@ def emit_markdown(payload: dict[str, Any]) -> None:
             print(f"- {item['local_time']}: {item['file']}")
 
 
-def main() -> int:
-    args = parse_args()
-    payload = build_payload(args)
-    if args.output:
-        output_path = Path(args.output).expanduser()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with output_path.open("w", encoding="utf-8", newline="\n") as handle:
-            if args.format == "json":
+def write_private_output(
+    output_path: Path,
+    output_format: str,
+    payload: dict[str, Any],
+) -> None:
+    output_path = output_path.expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            if output_format == "json":
                 json.dump(payload, handle, ensure_ascii=False, indent=2)
                 handle.write("\n")
             else:
                 with contextlib.redirect_stdout(handle):
                     emit_markdown(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output_path)
+        output_path.chmod(0o600)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(file_descriptor)
+        with contextlib.suppress(OSError):
+            temporary_path.unlink()
+        raise
+
+
+def main() -> int:
+    args = parse_args()
+    payload = build_payload(args)
+    if args.output:
+        write_private_output(Path(args.output), args.format, payload)
     elif args.format == "json":
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         print()

@@ -6,7 +6,9 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -28,12 +30,17 @@ def report_args(
     project_root: Path | None = None,
     session_id: str | None = None,
     repo_root: Path | None = None,
+    mode: str = "evidence",
+    match_terms: tuple[str, ...] = (),
+    sources: str | None = None,
 ) -> object:
     cwd = cwd or layout.repo_root
     project_root = project_root or cwd
     argv = [
         "--scope",
         scope,
+        "--mode",
+        mode,
         "--start",
         "2026-07-31T00:00:00+00:00",
         "--end",
@@ -61,6 +68,10 @@ def report_args(
     ]
     if session_id:
         argv.extend(["--session-id", session_id])
+    for term in match_terms:
+        argv.extend(["--match", term])
+    if sources:
+        argv.extend(["--sources", sources])
     return module.parse_args(argv)
 
 
@@ -103,9 +114,9 @@ def test_json_contract_has_stable_versions_hash_and_source_shape(
     payload = activity_module.build_payload(report_args(activity_module, synthetic_layout))
 
     expected_hash = hashlib.sha256(Path(activity_module.__file__).read_bytes()).hexdigest()
-    assert payload["schema_version"] == "2.0"
+    assert payload["schema_version"] == "2.1"
     assert payload["collector"]["name"] == "codex-session-analysis"
-    assert payload["collector"]["version"] == "2.1.0"
+    assert payload["collector"]["version"] == "2.2.0"
     assert payload["collector"]["script_sha256"] == expected_hash
     assert re.fullmatch(r"[0-9a-f]{64}", expected_hash)
     assert set(payload["diagnostics"]["sources"]) == {
@@ -204,6 +215,255 @@ def test_first_session_meta_is_canonical_with_separate_parent_and_fork(
     assert {event["cwd"] for event in activity} == {str(child_project)}
 
 
+def test_build_payload_scans_each_session_file_once(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    project = synthetic_layout.repo_root / "single-pass-project"
+    project.mkdir()
+    for suffix in ("alpha", "beta"):
+        session_id = f"session-single-pass-{suffix}"
+        jsonl_writer(
+            synthetic_layout.sessions / f"rollout-{session_id}.jsonl",
+            [
+                session_meta(session_id, project, "2026-08-01T08:00:00Z"),
+                {
+                    "timestamp": "2026-08-01T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "synthetic"},
+                },
+            ],
+        )
+
+    payload = activity_module.build_payload(
+        report_args(activity_module, synthetic_layout, scope="global")
+    )
+
+    source = payload["diagnostics"]["sources"]["sessions"]
+    assert source["files_read"] == 2
+    assert source["scan_passes"] == 2
+    assert payload["scope"]["session_scan"]["files_read"] == 2
+    assert payload["scope"]["session_scan"]["strategy"] == "full_scan"
+
+
+def test_explicit_session_id_uses_validated_filename_fast_path(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    project = synthetic_layout.repo_root / "fast-path-project"
+    project.mkdir()
+    selected_id = "session-fast-path-selected"
+    other_id = "session-fast-path-other"
+    for session_id in (selected_id, other_id):
+        jsonl_writer(
+            synthetic_layout.sessions / f"rollout-{session_id}.jsonl",
+            [
+                session_meta(session_id, project, "2026-08-01T08:00:00Z"),
+                {
+                    "timestamp": "2026-08-01T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "synthetic"},
+                },
+            ],
+        )
+
+    payload = activity_module.build_payload(
+        report_args(
+            activity_module,
+            synthetic_layout,
+            scope="session",
+            cwd=project,
+            project_root=project,
+            session_id=selected_id,
+        )
+    )
+
+    source = payload["diagnostics"]["sources"]["sessions"]
+    assert source["files_read"] == 1
+    assert source["scan_passes"] == 1
+    assert [session["session_id"] for session in payload["sessions"]] == [selected_id]
+    assert payload["scope"]["session_scan"] == {
+        "strategy": "session_id_filename_fast_path",
+        "files_available": 2,
+        "files_read": 1,
+        "fallback_used": False,
+    }
+
+
+def test_activity_inventory_uses_only_semantic_anchors(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    session_id = "session-anchors-0001"
+    project = synthetic_layout.repo_root / "anchor-project"
+    project.mkdir()
+    jsonl_writer(
+        synthetic_layout.sessions / f"rollout-{session_id}.jsonl",
+        [
+            session_meta(session_id, project, "2026-08-01T08:00:00Z"),
+            {
+                "timestamp": "2026-08-01T08:01:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-one"},
+            },
+            response_item(
+                "2026-08-01T08:02:00Z",
+                {"type": "reasoning", "summary": ["synthetic non-anchor"]},
+            ),
+            {
+                "timestamp": "2026-08-01T08:03:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "synthetic"},
+            },
+            response_item(
+                "2026-08-01T08:04:00Z",
+                {"type": "message", "phase": "final_answer", "content": []},
+            ),
+            {
+                "timestamp": "2026-08-01T08:05:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn-one"},
+            },
+        ],
+    )
+
+    events = activity_module.collect_session_activity_events(
+        synthetic_layout.codex_home, START, END
+    )
+
+    assert [event["timestamp"] for event in events] == [
+        "2026-08-01T08:01:00+00:00",
+        "2026-08-01T08:03:00+00:00",
+        "2026-08-01T08:04:00+00:00",
+        "2026-08-01T08:05:00+00:00",
+    ]
+
+
+def test_locator_defaults_to_safe_sources_and_returns_task_candidates(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    project = synthetic_layout.repo_root / "locator-project"
+    project.mkdir()
+    selected_id = "session-locator-selected"
+    unrelated_id = "session-locator-unrelated"
+    for session_id, message in (
+        (selected_id, "needle-locator synthetic request"),
+        (unrelated_id, "UNRELATED_LOCATOR_SENTINEL"),
+    ):
+        jsonl_writer(
+            synthetic_layout.sessions / f"rollout-{session_id}.jsonl",
+            [
+                session_meta(session_id, project, "2026-08-01T08:00:00Z"),
+                {
+                    "timestamp": "2026-08-01T08:01:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": f"turn-{session_id}"},
+                },
+                {
+                    "timestamp": "2026-08-01T08:02:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": message},
+                },
+                {
+                    "timestamp": "2026-08-01T08:03:00Z",
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete", "turn_id": f"turn-{session_id}"},
+                },
+            ],
+        )
+    jsonl_writer(
+        synthetic_layout.codex_home / "history.jsonl",
+        [
+            {
+                "ts": "2026-08-01T08:02:00Z",
+                "session_id": selected_id,
+                "text": "needle-locator synthetic request",
+            },
+            {
+                "ts": "2026-08-01T08:02:00Z",
+                "session_id": unrelated_id,
+                "text": "UNRELATED_LOCATOR_SENTINEL",
+            },
+        ],
+    )
+    (synthetic_layout.summaries / "2026-08-01T08-30-00-locator.md").write_text(
+        "needle-locator summary\n", encoding="utf-8"
+    )
+    (synthetic_layout.notes / "must-not-scan.md").write_text(
+        "needle-locator note\n", encoding="utf-8"
+    )
+
+    payload = activity_module.build_payload(
+        report_args(
+            activity_module,
+            synthetic_layout,
+            scope="global",
+            mode="locate",
+            match_terms=("needle-locator",),
+        )
+    )
+
+    assert payload["mode"] == "locate"
+    assert payload["sources_enabled"] == ["history", "sessions", "rollout_summaries"]
+    assert payload["locator"]["query"] == {
+        "term_count": 1,
+        "terms_included": False,
+        "sources": ["history", "sessions", "rollout_summaries"],
+    }
+    assert payload["locator"]["candidate_count"] == 1
+    candidate = payload["locator"]["candidates"][0]
+    assert candidate["rank"] == 1
+    assert candidate["session_id"] == selected_id
+    assert candidate["hit_kinds"] == ["user_message"]
+    assert candidate["tasks"][0]["turn_id"] == f"turn-{selected_id}"
+    assert [item["session_id"] for item in payload["history"]] == [selected_id]
+    assert len(payload["rollout_summaries"]) == 1
+    assert payload["diagnostics"]["sources"]["git"]["skipped_reason"] == "source_filter"
+    assert payload["diagnostics"]["sources"]["notes"]["skipped_reason"] == "source_filter"
+    assert "UNRELATED_LOCATOR_SENTINEL" not in json.dumps(payload)
+
+    markdown = render_markdown(activity_module, payload)
+    assert "# Codex Session Locator" in markdown
+    assert "--scope session --session-id <id>" in markdown
+    assert "UNRELATED_LOCATOR_SENTINEL" not in markdown
+
+
+def test_locator_source_override_and_required_match_validation(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+) -> None:
+    with pytest.raises(SystemExit):
+        activity_module.parse_args(["--mode", "locate"])
+
+    args = report_args(
+        activity_module,
+        synthetic_layout,
+        scope="global",
+        mode="locate",
+        match_terms=("synthetic",),
+        sources="sessions",
+    )
+    payload = activity_module.build_payload(args)
+    assert payload["sources_enabled"] == ["sessions"]
+    assert payload["diagnostics"]["sources"]["history"]["skipped_reason"] == "source_filter"
+    assert payload["diagnostics"]["sources"]["sessions"]["status"] == "ok"
+
+
+def test_version_reports_collector_and_schema(
+    activity_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        activity_module.parse_args(["--version"])
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == "codex-session-analysis 2.2.0 (schema 2.1)"
+
+
 def test_legacy_and_modern_calls_separate_records_invocations_and_workdirs(
     activity_module: ModuleType,
     synthetic_layout: SimpleNamespace,
@@ -270,6 +530,15 @@ def test_legacy_and_modern_calls_separate_records_invocations_and_workdirs(
         + attribution["unresolved_records"]
         == session["tool_call_records"]
     )
+    assert session["tool_activity"]["parser_resolution"] == {
+        "invocation": {"resolved_records": 3, "unresolved_records": 0},
+        "workdir": {
+            "explicit_records": 2,
+            "session_cwd_fallback_records": 0,
+            "unresolved_records": 1,
+        },
+        "syntax_dynamic_uncertain_records": 1,
+    }
 
 
 def test_session_scope_skips_unbound_notes(
@@ -436,6 +705,73 @@ def test_javascript_scanner_binds_workdirs_to_tool_calls_and_avoids_lexical_trap
     )
 
 
+def test_javascript_strings_decode_without_python_syntax_warnings(
+    activity_module: ModuleType,
+) -> None:
+    source = (
+        r"await tools.real({workdir: 'C:\ synthetic\x2fproject'}); "
+        r"await tools.other({workdir: '\u002ftmp\u002fsecond'});"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SyntaxWarning)
+        names, workdirs, unresolved = activity_module.javascript_wrapper_details(source)
+
+    assert names == ["real", "other"]
+    assert workdirs == ["C: synthetic/project", "/tmp/second"]
+    assert unresolved is True
+
+
+def test_tool_parser_reports_independent_resolution_dimensions(
+    activity_module: ModuleType,
+) -> None:
+    explicit_path = "/tmp/synthetic-explicit"
+    parsed = activity_module.parse_tool_record(
+        {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": (
+                r"const pattern = /synthetic/; await tools.real({workdir: "
+                + json.dumps(explicit_path)
+                + "});"
+            ),
+        }
+    )
+
+    assert parsed is not None
+    assert parsed["resolved"] is False
+    assert parsed["invocation_resolved"] is True
+    assert parsed["workdir_attribution"] == "explicit"
+    assert parsed["syntax_dynamic_uncertain"] is True
+
+    dynamic = activity_module.parse_tool_record(
+        {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": "const target = choose(); await tools.real({workdir: target});",
+        }
+    )
+    assert dynamic is not None
+    assert dynamic["invocation_resolved"] is True
+    assert dynamic["workdir_attribution"] == "unresolved"
+    assert dynamic["syntax_dynamic_uncertain"] is True
+
+
+def test_private_output_is_atomic_and_mode_0600_under_umask_022(
+    activity_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "evidence.json"
+    previous_umask = os.umask(0o022)
+    try:
+        activity_module.write_private_output(output, "json", {"synthetic": True})
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    assert json.loads(output.read_text(encoding="utf-8")) == {"synthetic": True}
+    assert list(tmp_path.glob(".evidence.json.*.tmp")) == []
+
+
 def test_modern_tool_workdir_drives_project_match_with_provenance(
     activity_module: ModuleType,
     synthetic_layout: SimpleNamespace,
@@ -495,6 +831,220 @@ def test_modern_tool_workdir_drives_project_match_with_provenance(
             "cwd": str(project_b),
         }
     ]
+
+
+def test_project_scope_binds_history_and_metrics_to_matching_tasks(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    session_id = "session-task-gating-0001"
+    home_project = synthetic_layout.repo_root / "home-project"
+    target_project = synthetic_layout.repo_root / "target-project"
+    for project in (home_project, target_project):
+        project.mkdir()
+        (project / ".git").mkdir()
+    rows = [
+        session_meta(session_id, home_project, "2026-08-01T08:00:00Z"),
+        {
+            "timestamp": "2026-08-01T08:01:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "target-task"},
+        },
+        {
+            "timestamp": "2026-08-01T08:02:00Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "target prompt"},
+        },
+        response_item(
+            "2026-08-01T08:03:00Z",
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": (
+                    "await tools.exec_command({cmd: 'synthetic', workdir: "
+                    + json.dumps(str(target_project))
+                    + "});"
+                ),
+            },
+        ),
+        {
+            "timestamp": "2026-08-01T08:04:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "target-task"},
+        },
+        {
+            "timestamp": "2026-08-01T09:01:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "unrelated-task"},
+        },
+        {
+            "timestamp": "2026-08-01T09:02:00Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "unrelated prompt"},
+        },
+        response_item(
+            "2026-08-01T09:03:00Z",
+            {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "synthetic", "workdir": str(home_project)}),
+            },
+        ),
+        {
+            "timestamp": "2026-08-01T09:04:00Z",
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "unrelated-task"},
+        },
+    ]
+    jsonl_writer(synthetic_layout.sessions / f"rollout-{session_id}.jsonl", rows)
+    jsonl_writer(
+        synthetic_layout.codex_home / "history.jsonl",
+        [
+            {"ts": "2026-08-01T08:00:58Z", "session_id": session_id, "text": "target prompt"},
+            {
+                "ts": "2026-08-01T08:00:50Z",
+                "session_id": session_id,
+                "text": "PRELUDE_TOO_EARLY_SENTINEL",
+            },
+            {
+                "ts": "2026-08-01T09:02:00Z",
+                "session_id": session_id,
+                "text": "UNRELATED_PRIVATE_SENTINEL",
+            },
+        ],
+    )
+
+    payload = activity_module.build_payload(
+        report_args(
+            activity_module,
+            synthetic_layout,
+            scope="project",
+            cwd=target_project,
+            project_root=target_project,
+            repo_root=target_project,
+        )
+    )
+
+    assert [item["text"] for item in payload["history"]] == ["target prompt"]
+    assert "UNRELATED_PRIVATE_SENTINEL" not in json.dumps(payload)
+    assert "PRELUDE_TOO_EARLY_SENTINEL" not in json.dumps(payload)
+    assert len(payload["sessions"]) == 1
+    session = payload["sessions"][0]
+    assert session["events"] == 4
+    assert session["user_events"] == 1
+    assert session["tool_call_records"] == 1
+    assert session["task_scope"] == {
+        "mode": "task_bound",
+        "matched_tasks": 1,
+        "tasks_in_range": 2,
+        "history_previews_bound": True,
+    }
+
+
+def test_project_scope_suppresses_unbound_legacy_history(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    session_id = "session-unbound-legacy-0001"
+    project = synthetic_layout.repo_root / "legacy-project"
+    project.mkdir()
+    jsonl_writer(
+        synthetic_layout.sessions / f"rollout-{session_id}.jsonl",
+        [
+            session_meta(session_id, project, "2026-08-01T08:00:00Z"),
+            {
+                "timestamp": "2026-08-01T08:02:00Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "legacy prompt"},
+            },
+        ],
+    )
+    jsonl_writer(
+        synthetic_layout.codex_home / "history.jsonl",
+        [
+            {
+                "ts": "2026-08-01T08:02:00Z",
+                "session_id": session_id,
+                "text": "LEGACY_PRIVATE_SENTINEL",
+            }
+        ],
+    )
+
+    payload = activity_module.build_payload(
+        report_args(
+            activity_module,
+            synthetic_layout,
+            scope="project",
+            cwd=project,
+            project_root=project,
+            repo_root=project,
+        )
+    )
+
+    assert payload["history"] == []
+    assert len(payload["sessions"]) == 1
+    assert payload["sessions"][0]["task_scope"] == {
+        "mode": "unbound_suppressed",
+        "matched_tasks": 0,
+        "tasks_in_range": 0,
+        "history_previews_bound": False,
+    }
+    assert "LEGACY_PRIVATE_SENTINEL" not in json.dumps(payload)
+
+
+def test_tool_workdirs_resolve_against_session_cwd_not_collector_cwd(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+    jsonl_writer,
+) -> None:
+    project_a = synthetic_layout.repo_root / "relative-project-a"
+    project_b = synthetic_layout.repo_root / "relative-project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    session_id = "session-relative-workdir-0001"
+    jsonl_writer(
+        synthetic_layout.sessions / f"rollout-{session_id}.jsonl",
+        [
+            session_meta(session_id, project_a, "2026-08-01T08:00:00Z"),
+            {
+                "timestamp": "2026-08-01T08:01:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "relative-task"},
+            },
+            response_item(
+                "2026-08-01T08:02:00Z",
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": json.dumps(
+                        {"cmd": "synthetic", "workdir": "../relative-project-b"}
+                    ),
+                },
+            ),
+            {
+                "timestamp": "2026-08-01T08:03:00Z",
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "relative-task"},
+            },
+        ],
+    )
+
+    sessions = activity_module.collect_sessions(
+        synthetic_layout.codex_home,
+        START,
+        END,
+        BERLIN,
+        cwd_root=project_b,
+    )
+    assert len(sessions) == 1
+    assert sessions[0]["scope_match"] == {
+        "reason": "tool_workdir",
+        "matched_path": str(project_b),
+    }
+    assert activity_module.resolve_tool_workdir("$PWD", str(project_a)) is None
+    assert activity_module.resolve_tool_workdir("${PROJECT_ROOT}", str(project_a)) is None
 
 
 def test_berlin_dst_day_lengths_and_invalid_naive_clock_times(
