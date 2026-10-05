@@ -1,6 +1,6 @@
 # JSON Contract
 
-The helper emits schema `2.1`. Treat a payload without `schema_version` as the legacy schema.
+The helper emits schema `2.2`. Treat a payload without `schema_version` as the legacy schema.
 
 ## Contents
 
@@ -13,6 +13,8 @@ The helper emits schema `2.1`. Treat a payload without `schema_version` as the l
 - [Diagnostics](#diagnostics)
 
 ## Compatibility
+
+Schema 2.2 keeps every schema-2.1 field. It adds `unknown_record_types` to every diagnostics source entry, stops counting unknown session record types as a coverage loss, and reports absent optional source directories as `skipped` with `skipped_reason: "source_not_present"` instead of `unavailable`. Consumers that only read `diagnostics.status` can therefore see `complete` where schema 2.1 reported `partial`.
 
 Schema 2.1 keeps every schema-2.0 top-level section and its existing fields within `scope`, `range`, `paths`, `history`, `sessions`, `git_activity`, `notes`, and `work_time_estimate`. It changes project/local selection from session-wide to task-bound history and metrics. The following legacy aliases remain intentional:
 
@@ -30,10 +32,10 @@ Use these fields to identify the contract and exact collector implementation:
 
 ```json
 {
-  "schema_version": "2.1",
+  "schema_version": "2.2",
   "collector": {
     "name": "codex-session-analysis",
-    "version": "2.2.0",
+    "version": "2.2.1",
     "script_sha256": "<64 lowercase hexadecimal characters>",
     "generated_at_utc": "<ISO 8601 UTC timestamp>"
   }
@@ -166,6 +168,7 @@ Every source entry has this shape:
   "schema_errors": 0,
   "invalid_timestamps": 0,
   "unknown_records": 0,
+  "unknown_record_types": {},
   "io_errors": 0,
   "command_errors": 0,
   "timeouts": 0,
@@ -176,6 +179,10 @@ Every source entry has this shape:
 
 `scan_passes` counts collector passes; file and record-quality counters are deduplicated by source path.
 
-Diagnostics expose aggregate counts and stable warning codes only. They never contain malformed source lines, prompt text, tool arguments, Git stderr, exception text, or secret values. A deliberately skipped source does not make overall coverage partial; malformed, unknown, unreadable, failed, or timed-out active sources do.
+Codex adds new session record types over time (for example `token_usage_record` since CLI 0.153). Records whose top-level `type` the collector does not interpret are counted in `unknown_records` and broken down in `unknown_record_types`. A type name is emitted only when it matches `[a-z][a-z0-9_]{0,63}`; a missing or empty type is counted as `<missing>`, and any other value as `<non_identifier>`. Unknown record types do not change the source status. They add an info warning `<source>_unknown_record_types` so the allow-list can be extended in a later release.
+
+Rollout summaries (`<codex-home>/memories/rollout_summaries`) and notes are optional sources. When their directory does not exist, the source is `skipped` with `skipped_reason: "source_not_present"` and an info warning `<source>_not_present`; this does not make overall coverage partial. An explicitly passed `--notes-root` that does not exist remains `unavailable`, because the caller asked for that source.
+
+Diagnostics expose aggregate counts, sanitized record type names, and stable warning codes only. They never contain malformed source lines, prompt text, tool arguments, Git stderr, exception text, or secret values. A skipped or absent optional source does not make overall coverage partial; malformed, unreadable, schema-invalid, failed, or timed-out active sources do.
 
 `diagnostics.tool_parser.resolution` aggregates the same independent invocation, workdir, and syntax/dynamic dimensions documented under Tool Activity. The legacy aggregate `diagnostics.tool_parser.unresolved_records` remains available.

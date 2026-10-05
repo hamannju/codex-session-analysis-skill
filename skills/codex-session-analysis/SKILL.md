@@ -104,7 +104,7 @@ uv run --with tzdata -- python "$HOME\.codex\skills\codex-session-analysis\scrip
 
 If the Codex Desktop App stores history somewhere other than `$HOME\.codex`, pass that directory with `--codex-home`.
 
-For programmatic JSON use, read [references/json-contract.md](references/json-contract.md) before querying fields. Check `schema_version`, the collector hash, `scope.session_scan`, and `diagnostics.status`; state a coverage caveat when diagnostics are partial. Evidence files written with `--output` are atomically replaced and forced to mode `0600`.
+For programmatic JSON use, read [references/json-contract.md](references/json-contract.md) before querying fields. Check `schema_version`, the collector hash, `scope.session_scan`, and `diagnostics.status`. State a coverage caveat only when `diagnostics.status` is `partial`, and name the affected sources and counters. Absent optional sources (`skipped_reason: "source_not_present"`, for example no rollout summaries or no Obsidian folder) and info-level `*_unknown_record_types` warnings are not coverage gaps: mention them at most neutrally in the sources line, never as missing or failed evidence. Evidence files written with `--output` are atomically replaced and forced to mode `0600`.
 
 Use `--version` for a zero-scan collector/schema check.
 
@@ -127,9 +127,9 @@ Use these local sources, in this order:
 
 - `$HOME/.codex/history.jsonl`: primary user prompt index.
 - `$HOME/.codex/sessions/**/*.jsonl`: session metadata, working directories, and tool activity.
-- `$HOME/.codex/memories/rollout_summaries/*.md`: compact cross-session summaries. Treat these as helpful synthesis and verify important claims with logs or git activity when possible.
+- `$HOME/.codex/memories/rollout_summaries/*.md`: optional compact cross-session summaries; they exist only when Codex memories are enabled. Treat these as helpful synthesis and verify important claims with logs or git activity when possible.
 - `$HOME/gitlab/*` and `$HOME/github/*`: git commit activity in the requested range.
-- `$HOME/Obsidian` Markdown files: optional documentation evidence when note changes matter.
+- `$HOME/Obsidian` Markdown files (or `--notes-root`): optional documentation evidence when note changes matter; many machines have none.
 
 For project scope and the project portion of local scope, the helper binds history and metrics to matching task spans. A task matches through the canonical session `cwd` or a recognized tool-call workdir. Taskless legacy candidates remain visible but session-wide prompt previews are suppressed. If the current Codex runtime exposes `CODEX_THREAD_ID` or `CODEX_SESSION_ID`, the helper uses it for `local` and `session` scope.
 

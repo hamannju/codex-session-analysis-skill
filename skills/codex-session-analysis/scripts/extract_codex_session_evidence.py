@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-SCHEMA_VERSION = "2.1"
-COLLECTOR_VERSION = "2.2.0"
+SCHEMA_VERSION = "2.2"
+COLLECTOR_VERSION = "2.2.1"
 SCRIPT_PATH = Path(__file__).resolve()
 SOURCE_NAMES = ("history", "sessions", "rollout_summaries", "git", "notes")
 TASK_HISTORY_PRELUDE_SECONDS = 5
@@ -29,9 +29,13 @@ KNOWN_SESSION_RECORD_TYPES = {
     "inter_agent_communication_metadata",
     "response_item",
     "session_meta",
+    "token_usage_record",
     "turn_context",
     "world_state",
 }
+# Unknown record type names are reported only when they look like schema identifiers.
+RECORD_TYPE_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+SOURCE_NOT_PRESENT = "source_not_present"
 
 SECRET_CONTEXT_RE = re.compile(
     r"(?i)\b(password|passwd|token|secret|api[_-]?key|bearer|credential|private[_-]?key|pat)\b"
@@ -55,6 +59,7 @@ class SourceDiagnostic:
     schema_errors: int = 0
     invalid_timestamps: int = 0
     unknown_records: int = 0
+    unknown_record_types: dict[str, int] = field(default_factory=dict)
     io_errors: int = 0
     command_errors: int = 0
     timeouts: int = 0
@@ -91,7 +96,6 @@ class SourceDiagnostic:
             or self.non_object_records
             or self.schema_errors
             or self.invalid_timestamps
-            or self.unknown_records
             or self.io_errors
             or self.command_errors
             or self.timeouts
@@ -109,6 +113,7 @@ class SourceDiagnostic:
             "schema_errors": self.schema_errors,
             "invalid_timestamps": self.invalid_timestamps,
             "unknown_records": self.unknown_records,
+            "unknown_record_types": dict(sorted(self.unknown_record_types.items())),
             "io_errors": self.io_errors,
             "command_errors": self.command_errors,
             "timeouts": self.timeouts,
@@ -420,6 +425,14 @@ def matches_terms(values: list[str], match_terms: list[str] | tuple[str, ...]) -
     return any(term in haystack for term in terms)
 
 
+def unknown_record_type_label(value: Any) -> str:
+    if value is None or value == "":
+        return "<missing>"
+    if isinstance(value, str) and RECORD_TYPE_NAME_RE.fullmatch(value):
+        return value
+    return "<non_identifier>"
+
+
 def iter_jsonl(
     path: Path,
     diagnostics: CollectorDiagnostics | None = None,
@@ -456,9 +469,14 @@ def iter_jsonl(
                         if timestamp_value is not None and parse_event_ts(timestamp_value) is None:
                             source_diagnostic.invalid_timestamps += 1
                         if source == "sessions":
-                            record_type = str(obj.get("type") or "<missing>")
+                            raw_type = obj.get("type")
+                            record_type = raw_type if isinstance(raw_type, str) else ""
                             if record_type not in KNOWN_SESSION_RECORD_TYPES:
                                 source_diagnostic.unknown_records += 1
+                                type_label = unknown_record_type_label(raw_type)
+                                source_diagnostic.unknown_record_types[type_label] = (
+                                    source_diagnostic.unknown_record_types.get(type_label, 0) + 1
+                                )
                             elif record_type == "session_meta":
                                 payload = obj.get("payload")
                                 if not (
@@ -2011,7 +2029,7 @@ def collect_rollout_summaries(
     results: list[dict[str, str]] = []
     if not root.exists():
         if diagnostics:
-            diagnostics.source("rollout_summaries").unavailable("rollout summary source directory does not exist")
+            diagnostics.source("rollout_summaries").skip(SOURCE_NOT_PRESENT)
         return results
     for path in sorted(root.glob("*.md")):
         source_diagnostic = diagnostics.source("rollout_summaries") if diagnostics else None
@@ -2175,11 +2193,14 @@ def collect_notes(
     local_tz: ZoneInfo,
     match_terms: list[str] | None = None,
     diagnostics: CollectorDiagnostics | None = None,
+    required: bool = False,
 ) -> list[dict[str, str]]:
     notes: list[dict[str, str]] = []
     if not root.exists():
-        if diagnostics:
+        if diagnostics and required:
             diagnostics.source("notes").unavailable("notes source directory does not exist")
+        elif diagnostics:
+            diagnostics.source("notes").skip(SOURCE_NOT_PRESENT)
         return notes
     for path in sorted(root.rglob("*.md")):
         source_diagnostic = diagnostics.source("notes") if diagnostics else None
@@ -2384,6 +2405,15 @@ def finalize_diagnostics(
                     "message": f"The {source} source has incomplete collector coverage; inspect its counters.",
                 }
             )
+        elif item["status"] == "skipped" and item["skipped_reason"] == SOURCE_NOT_PRESENT:
+            warnings.append(
+                {
+                    "code": f"{source}_not_present",
+                    "severity": "info",
+                    "source": source,
+                    "message": f"The optional {source} source does not exist on this machine; nothing was missed.",
+                }
+            )
         elif item["status"] == "skipped":
             warnings.append(
                 {
@@ -2391,6 +2421,18 @@ def finalize_diagnostics(
                     "severity": "info",
                     "source": source,
                     "message": f"The {source} source was intentionally skipped: {item['skipped_reason']}.",
+                }
+            )
+        if item["unknown_records"]:
+            warnings.append(
+                {
+                    "code": f"{source}_unknown_record_types",
+                    "severity": "info",
+                    "source": source,
+                    "message": (
+                        f"{item['unknown_records']} records use types this collector does not interpret; "
+                        "they do not reduce coverage. See unknown_record_types."
+                    ),
                 }
             )
 
@@ -2698,6 +2740,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             local_tz,
             match_terms=(args.match if args.mode == "locate" else notes_terms),
             diagnostics=diagnostics,
+            required=bool(args.notes_root),
         )
     work_time_estimate = estimate_work_time(activity_events, local_tz, args.activity_gap_minutes)
     collector_diagnostics = finalize_diagnostics(diagnostics, sessions)
@@ -2953,6 +2996,10 @@ def emit_markdown(payload: dict[str, Any]) -> None:
         )
     for warning in diagnostics["warnings"]:
         print(f"- {warning['severity'].title()} [{warning['code']}] ({warning['source']}): {warning['message']}")
+    for source, item in diagnostics["sources"].items():
+        if item["unknown_record_types"]:
+            counts = ", ".join(f"`{name}` {count}" for name, count in item["unknown_record_types"].items())
+            print(f"- Unknown {source} record types: {counts}")
     print()
 
     notes = payload["notes"]

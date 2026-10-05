@@ -114,9 +114,9 @@ def test_json_contract_has_stable_versions_hash_and_source_shape(
     payload = activity_module.build_payload(report_args(activity_module, synthetic_layout))
 
     expected_hash = hashlib.sha256(Path(activity_module.__file__).read_bytes()).hexdigest()
-    assert payload["schema_version"] == "2.1"
+    assert payload["schema_version"] == "2.2"
     assert payload["collector"]["name"] == "codex-session-analysis"
-    assert payload["collector"]["version"] == "2.2.0"
+    assert payload["collector"]["version"] == "2.2.1"
     assert payload["collector"]["script_sha256"] == expected_hash
     assert re.fullmatch(r"[0-9a-f]{64}", expected_hash)
     assert set(payload["diagnostics"]["sources"]) == {
@@ -139,6 +139,7 @@ def test_json_contract_has_stable_versions_hash_and_source_shape(
             "schema_errors",
             "invalid_timestamps",
             "unknown_records",
+            "unknown_record_types",
             "io_errors",
             "command_errors",
             "timeouts",
@@ -461,7 +462,7 @@ def test_version_reports_collector_and_schema(
     with pytest.raises(SystemExit) as exc_info:
         activity_module.parse_args(["--version"])
     assert exc_info.value.code == 0
-    assert capsys.readouterr().out.strip() == "codex-session-analysis 2.2.0 (schema 2.1)"
+    assert capsys.readouterr().out.strip() == "codex-session-analysis 2.2.1 (schema 2.2)"
 
 
 def test_legacy_and_modern_calls_separate_records_invocations_and_workdirs(
@@ -1252,5 +1253,110 @@ def test_unknown_session_record_type_is_counted_without_echoing_value(
     result = activity_module.finalize_diagnostics(diagnostics, [])
 
     assert result["sources"]["sessions"]["unknown_records"] == 1
-    assert result["sources"]["sessions"]["status"] == "partial"
+    assert result["sources"]["sessions"]["unknown_record_types"] == {"<non_identifier>": 1}
+    assert result["sources"]["sessions"]["status"] == "ok"
+    assert result["complete"] is True
+    assert {warning["code"] for warning in result["warnings"]} == {"sessions_unknown_record_types"}
+    assert {warning["severity"] for warning in result["warnings"]} == {"info"}
     assert unknown_type not in json.dumps(result)
+
+
+def test_identifier_like_unknown_session_record_types_are_counted_by_name(
+    activity_module: ModuleType,
+    tmp_path: Path,
+    jsonl_writer,
+) -> None:
+    source_path = jsonl_writer(
+        tmp_path / "synthetic-session.jsonl",
+        [
+            {"timestamp": "2026-08-01T08:00:00Z", "type": "synthetic_future_record", "payload": {}},
+            {"timestamp": "2026-08-01T08:00:01Z", "type": "synthetic_future_record", "payload": {}},
+            {"timestamp": "2026-08-01T08:00:02Z", "payload": {}},
+            {"timestamp": "2026-08-01T08:00:03Z", "type": {"nested": "value"}, "payload": {}},
+        ],
+    )
+    diagnostics = activity_module.CollectorDiagnostics()
+
+    activity_module.read_jsonl(source_path, diagnostics, "sessions")
+    result = activity_module.finalize_diagnostics(diagnostics, [])
+    sessions = result["sources"]["sessions"]
+
+    assert sessions["unknown_records"] == 4
+    assert sessions["unknown_record_types"] == {
+        "<missing>": 1,
+        "<non_identifier>": 1,
+        "synthetic_future_record": 2,
+    }
+    assert sessions["status"] == "ok"
+    assert result["status"] == "complete"
+    assert "nested" not in json.dumps(result)
+
+
+def test_token_usage_record_is_a_known_session_record_type(
+    activity_module: ModuleType,
+    tmp_path: Path,
+    jsonl_writer,
+) -> None:
+    source_path = jsonl_writer(
+        tmp_path / "synthetic-session.jsonl",
+        [
+            session_meta("session-token-usage-0001", tmp_path, "2026-08-01T08:00:00Z"),
+            {
+                "timestamp": "2026-08-01T08:00:05Z",
+                "type": "token_usage_record",
+                "payload": {"turn_token_usage": {"input_tokens": 1, "output_tokens": 1}},
+            },
+        ],
+    )
+    diagnostics = activity_module.CollectorDiagnostics()
+
+    activity_module.read_jsonl(source_path, diagnostics, "sessions")
+    result = activity_module.finalize_diagnostics(diagnostics, [])
+
+    assert result["sources"]["sessions"]["records_read"] == 2
+    assert result["sources"]["sessions"]["unknown_records"] == 0
+    assert result["sources"]["sessions"]["unknown_record_types"] == {}
+    assert result["sources"]["sessions"]["status"] == "ok"
+    assert result["complete"] is True
+    assert result["warnings"] == []
+
+
+def test_absent_optional_sources_are_skipped_without_partial_coverage(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+) -> None:
+    synthetic_layout.summaries.rmdir()
+    args = report_args(activity_module, synthetic_layout)
+    args.notes_root = None
+    assert not (synthetic_layout.home / "Obsidian").exists()
+
+    payload = activity_module.build_payload(args)
+    diagnostics = payload["diagnostics"]
+
+    for source in ("rollout_summaries", "notes"):
+        assert diagnostics["sources"][source]["status"] == "skipped"
+        assert diagnostics["sources"][source]["skipped_reason"] == "source_not_present"
+    assert diagnostics["status"] == "complete"
+    assert diagnostics["complete"] is True
+    not_present = {
+        warning["code"]: warning["severity"]
+        for warning in diagnostics["warnings"]
+        if warning["code"].endswith("_not_present")
+    }
+    assert not_present == {"rollout_summaries_not_present": "info", "notes_not_present": "info"}
+    assert payload["rollout_summaries"] == []
+    assert payload["notes"] == []
+
+
+def test_explicit_missing_notes_root_still_reports_partial_coverage(
+    activity_module: ModuleType,
+    synthetic_layout: SimpleNamespace,
+) -> None:
+    synthetic_layout.notes.rmdir()
+
+    payload = activity_module.build_payload(report_args(activity_module, synthetic_layout))
+    notes = payload["diagnostics"]["sources"]["notes"]
+
+    assert notes["status"] == "unavailable"
+    assert notes["warnings"] == ["notes source directory does not exist"]
+    assert payload["diagnostics"]["status"] == "partial"
